@@ -39,8 +39,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # Formatting is platform-independent, so check it once. Keeping it off the
-  # Windows runner also avoids rustfmt disagreeing with a CRLF checkout.
+  # Formatting is platform-independent, so check it once. (Line endings are
+  # not a reason to keep it off Windows: .gitattributes pins the working tree
+  # to LF on every platform.)
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

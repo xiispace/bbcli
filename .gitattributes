@@ -1,0 +1,9 @@
+# Git checks text files out with CRLF on Windows by default, and this repo
+# compiles text into the binary: `include_str!` embeds skills/bytebase/SKILL.md
+# and everything under vendor/bytebase/. Left alone, a Windows-built bbcli
+# would ship different bytes than a Unix-built one, `install-skill` would see a
+# copy written by the other as modified and refuse without --force, and
+# vendor/ would stop being diffable against upstream.
+#
+# So normalise every text file to LF in the working tree on all platforms.
+* text=auto eol=lf

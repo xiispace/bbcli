@@ -102,8 +102,9 @@ mod tests {
     /// assert on them rather than on the file merely being non-empty.
     #[test]
     fn bundled_skill_carries_the_frontmatter_the_host_matches_on() {
-        assert!(
-            SKILL_MD.starts_with("---\n"),
+        assert_eq!(
+            SKILL_MD.lines().next().map(str::trim),
+            Some("---"),
             "frontmatter must open the file"
         );
         let name = SKILL_MD
@@ -119,6 +120,20 @@ mod tests {
             desc.len() > 40,
             "description is what the model matches on; got {} chars",
             desc.len()
+        );
+    }
+
+    /// The skill is compiled in with `include_str!`, so whatever line endings
+    /// the checkout has become the shipped bytes. Git hands Windows CRLF
+    /// unless told otherwise, which would make a Windows-built binary install
+    /// a copy a Unix-built one then reports as modified — and refuses to
+    /// overwrite without `--force`. `.gitattributes` pins LF; this is what
+    /// notices when it stops applying.
+    #[test]
+    fn the_bundled_skill_ships_lf_so_every_platform_installs_the_same_bytes() {
+        assert!(
+            !SKILL_MD.contains('\r'),
+            "SKILL.md was checked out with CRLF; see .gitattributes"
         );
     }
 
