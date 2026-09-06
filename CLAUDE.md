@@ -190,7 +190,13 @@ These are settled trade-offs, not gaps waiting to be filled.
   because a real `PENDING` and a `CHECKING` that never settled need
   different things from a person. There is no change-type flag: the server detects MIGRATE vs SDL
   from the sheet content, and upstream's `changeType` parameter is echoed
-  but unused.
+  but unused. `rolloutCreated: false` reports what bbcli did, not what
+  exists: some deployments create the rollout inside `CreatePlan` (observed
+  with identical `createTime`s), so a `NOT_STARTED` task can be there without
+  `--rollout`. Do not "fix" that mismatch by reporting the server's rollout
+  as bbcli's — the field answers "did this command create one", which is what
+  decides whether a retry would duplicate it. SKILL.md tells the agent to
+  check the rollout when it matters.
 
 - **Field descriptions print with their continuation lines.** proto3 has no
   `required`, so the resource-name formats and constraints an agent must not

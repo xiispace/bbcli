@@ -72,6 +72,20 @@ Read `nextAction` in the output and stop there:
 | `WAIT_PLAN_CHECK` | Checks were still running; re-run in a moment. |
 | `FIX_SQL_AND_RETRY` | A plan check failed or the issue was rejected — read `planChecks.results`. |
 
+`rolloutCreated: false` means *bbcli* did not create one. It is not a
+promise that nothing is queued: some servers create the rollout together with
+the plan, so a rollout with a `NOT_STARTED` task can exist even without
+`--rollout`. Nothing runs until someone starts that task, but if the user
+asked you to leave no trace, check it and say what you found:
+
+```bash
+bbcli api RolloutService/GetRollout --args '{"name": "<plan>/rollout"}'
+```
+
+A task that should never run can be skipped with
+`RolloutService/BatchSkipTasks`. There is no delete for sheets, plans or
+issues — an issue can only be moved to `CANCELED`, and not from `DONE`.
+
 Narrow an ambiguous database name with `--instance <id>` or `--project <id>`;
 both flags work on all three commands.
 
