@@ -518,7 +518,9 @@ mod tests {
     /// loopback one.
     #[test]
     fn pasted_bare_code_is_rejected() {
-        let err = parse_pasted("4/0AeanS0abc", REDIRECT).unwrap_err().to_string();
+        let err = parse_pasted("4/0AeanS0abc", REDIRECT)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not just the code"), "{err}");
     }
 
@@ -526,10 +528,7 @@ mod tests {
     #[test]
     fn pasted_state_mismatch_is_caught() {
         let params = parse_pasted(&format!("{REDIRECT}?code=abc&state=other"), REDIRECT).unwrap();
-        assert!(matches!(
-            classify(&params, "xyz"),
-            Callback::StateMismatch
-        ));
+        assert!(matches!(classify(&params, "xyz"), Callback::StateMismatch));
     }
 
     #[test]
@@ -540,7 +539,10 @@ mod tests {
         )
         .unwrap();
         let err = classify(&params, "xyz").into_error().to_string();
-        assert!(err.contains("access_denied") && err.contains("user said no"), "{err}");
+        assert!(
+            err.contains("access_denied") && err.contains("user said no"),
+            "{err}"
+        );
     }
 
     #[test]

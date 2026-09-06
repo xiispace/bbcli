@@ -1,6 +1,6 @@
 [package]
 name = "bbcli"
-version = "0.1.0"
+version = "2026.9.6"
 edition = "2021"
 description = "CLI for a Bytebase server (Connect protocol) with OAuth2 auto-refresh, for CLI agents like Claude Code"
 license = "Apache-2.0"
@@ -16,7 +16,6 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 fd-lock = "4"
-libc = "0.2"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,3 +23,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+# Only used for the SIGPIPE reset in main, which is Unix-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

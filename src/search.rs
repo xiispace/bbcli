@@ -342,7 +342,10 @@ mod tests {
             .get("name")
             .unwrap();
         let lines = desc_lines(desc_of(name));
-        assert!(lines.len() > 1, "expected a multi-line description: {lines:?}");
+        assert!(
+            lines.len() > 1,
+            "expected a multi-line description: {lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.starts_with("Format: instances/")),
             "resource-name format line missing: {lines:?}"

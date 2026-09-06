@@ -219,9 +219,7 @@ fn recovery_hint(code: Option<&str>) -> Option<&'static str> {
 pub fn parse_method(method: &str) -> Result<(&str, &str)> {
     let s = method.trim().trim_start_matches('/');
     let s = s.strip_prefix("bytebase.v1.").unwrap_or(s);
-    let (service, m) = s
-        .split_once(['/', '.'])
-        .ok_or_else(|| method_err(method))?;
+    let (service, m) = s.split_once(['/', '.']).ok_or_else(|| method_err(method))?;
     if service.is_empty() || m.is_empty() || m.contains(['/', '.']) {
         bail!("{}", method_err(method));
     }

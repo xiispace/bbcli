@@ -1,0 +1,153 @@
+name: Release
+
+# Cut a release by bumping Cargo.toml to the calver version, committing, then
+# pushing the matching tag:
+#
+#   git tag v2026.9.6 && git push origin v2026.9.6
+#
+# Make sure CI is green on main first — this workflow builds and publishes, it
+# does not re-run the test suite.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re-)publish, e.g. v2026.9.6"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: bbcli
+
+jobs:
+  # A tag whose Cargo version disagrees would ship binaries reporting a version
+  # that exists nowhere on GitHub — the exact thing a version is supposed to
+  # answer. Catch it in seconds, before spending four cross-compiles on it.
+  verify-tag:
+    name: Tag matches Cargo version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Compare
+        run: |
+          # `[package].version` is the only bare `version = ` line in
+          # Cargo.toml; dependency versions are all inline in their tables.
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag="${{ steps.resolve.outputs.tag }}"
+          if [[ "$tag" != "v$cargo_version" ]]; then
+            echo "::error::tag $tag does not match Cargo.toml version $cargo_version (expected v$cargo_version). Calver drops leading zeros — 2026.9.6, not 2026.09.06."
+            exit 1
+          fi
+          echo "tag $tag matches Cargo.toml version $cargo_version"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: false }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, cross: false }
+          - { os: macos-latest, target: aarch64-apple-darwin, cross: false }
+          # Windows is deliberately absent: nothing has yet proven the crate
+          # builds for it (see the `#[cfg(unix)]` SIGPIPE note in src/main.rs).
+          # Add the msvc triple once the CI test job has been green on
+          # windows-latest, not before — a target that fails to build blocks
+          # the release job for every other platform.
+    env:
+      # ring compiles C, so the aarch64 cross needs both a linker and a target
+      # C compiler. Harmless on the other runners: cargo and cc-rs only read
+      # the variables matching the target actually being built.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          NAME="${BIN}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}/vendor/bytebase"
+          cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          # The binary embeds vendor/bytebase/ (MIT Expat) via include_str!, so
+          # redistributing it carries that notice with it. Same paths the README
+          # points at, so its references still resolve inside the archive.
+          cp vendor/bytebase/LICENSE vendor/bytebase/SOURCE.md "dist/${NAME}/vendor/bytebase/"
+          (cd dist && tar -czf "${NAME}.tar.gz" "${NAME}")
+          # Per-archive sidecar; the release job concatenates them into one
+          # SHA256SUMS. `shasum -a 256` exists on both Linux and macOS runners.
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.BIN }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: [verify-tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.verify-tag.outputs.tag }}
+          name: ${{ needs.verify-tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

@@ -53,6 +53,27 @@ cargo build --release
 install -m 755 target/release/bbcli /usr/local/bin/   # or anywhere on PATH
 ```
 
+Tagged releases (`vYYYY.M.D`) publish prebuilt archives for linux and macOS on
+`x86_64` and `aarch64`, plus a `SHA256SUMS` covering all of them, so a machine
+without a Rust toolchain can install by download instead:
+
+```bash
+# with SHA256SUMS and the archive for your platform downloaded side by side:
+shasum -a 256 -c SHA256SUMS --ignore-missing      # exits non-zero on a mismatch
+tar -xzf bbcli-aarch64-apple-darwin.tar.gz        # ...and on nothing verified
+install -m 755 bbcli-aarch64-apple-darwin/bbcli /usr/local/bin/
+```
+
+`bbcli` is calendar-versioned, and `bbcli --version` reports two things — its
+own version and the Bytebase commit its embedded API catalog was vendored from:
+
+```
+bbcli 2026.9.6 (API catalog: bytebase c19b6bf4b46ab9f333bc2790bd8ed7992f9805ea)
+```
+
+The second half is what an `unimplemented` error is about: the server serves a
+method the catalog does not describe, or vice versa.
+
 ## Setup (for Claude Code and other agents)
 
 Five steps from an empty machine to a first query:
@@ -82,9 +103,13 @@ Five steps from an empty machine to a first query:
 4. **Install the agent skill** so the agent knows these commands exist:
 
    ```bash
-   cp -r skills/bytebase ~/.claude/skills/      # user-level (Claude Code)
-   cp -r skills/bytebase .claude/skills/        # or project-level
+   bbcli install-skill                          # ~/.claude/skills/bytebase/SKILL.md
+   bbcli install-skill --dest .claude/skills/bytebase/SKILL.md   # or project-level
    ```
+
+   The skill text ships inside the binary, so re-running this after an upgrade
+   is what keeps the installed copy from describing an older bbcli. Re-running
+   with nothing to change is a no-op; `--force` overwrites a copy you edited.
 
 5. **Run the first query** — find a database, then read from it:
 
@@ -123,6 +148,7 @@ bbcli skill query                              # bundled task guide
 | `api <Service/Method> [--args JSON \| --args-file F]` | Direct Connect call, prints the JSON response; non-2xx exits 1 with the server's message |
 | `search [--service S \| --operation-id O \| --schema T]` | Offline API catalog (embedded OpenAPI spec) |
 | `skill [name]` | Offline task guides (query, database-change, grant-permission) |
+| `install-skill [--dest F] [--force]` | Write the bundled agent skill (`SKILL.md`) to the agent's skills directory; default `~/.claude/skills/bytebase/SKILL.md` |
 | `config view` | Show the effective server (and its source) plus all logged-in servers |
 | `config use <name-or-url>` | Switch the active context (must already be logged in) |
 | `config check` | Verify connectivity and credentials; exits non-zero if unusable — usable as an agent/CI gate |
@@ -268,6 +294,15 @@ Connect endpoint, and verifies the full lifecycle: login (registration + PKCE
 + code exchange), `api` calls (args/args-file/error propagation),
 401-triggered refresh and replay, cross-process refresh-token adoption, and
 logout/revocation.
+
+CI (`.github/workflows/ci.yml`) runs clippy and the unit tests on Linux, macOS
+and Windows, `cargo fmt --check` once, and the E2E script on the two Unix
+runners — it drives the pasted-redirect path through `os.mkfifo`, which
+Windows has no equivalent for.
+
+Design constraints and the invariants behind the credential handling are
+written up in [CLAUDE.md](./CLAUDE.md) — worth a skim before changing the
+token store or the login flow.
 
 ## License
 

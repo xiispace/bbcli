@@ -9,8 +9,8 @@
 //!   [`edit_tokens`].
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 

@@ -5,6 +5,7 @@
 //! sources the MCP tools use. Designed to be driven by CLI agents (Claude
 //! Code, ...) — pair with the agent skill in `skills/bytebase/SKILL.md`.
 
+mod agent_skill;
 mod client;
 mod oauth;
 mod search;
@@ -34,10 +35,7 @@ Note: this guide uses MCP tool syntax. Equivalent bbcli commands:
 /// Task guides embedded from `backend/api/mcp/skills/` (same content the MCP
 /// get_skill tool serves).
 const SKILLS: &[(&str, &str)] = &[
-    (
-        "query",
-        include_str!("../vendor/bytebase/skills/query.md"),
-    ),
+    ("query", include_str!("../vendor/bytebase/skills/query.md")),
     (
         "database-change",
         include_str!("../vendor/bytebase/skills/database-change.md"),
@@ -119,6 +117,17 @@ enum Command {
         /// Guide name: query | database-change | grant-permission
         name: Option<String>,
     },
+    /// Install the agent skill (the SKILL.md that teaches an agent these
+    /// commands) into the agent's skills directory
+    InstallSkill {
+        /// Where to write it (default: ~/.claude/skills/bytebase/SKILL.md).
+        /// Project-level: --dest .claude/skills/bytebase/SKILL.md
+        #[arg(long)]
+        dest: Option<std::path::PathBuf>,
+        /// Overwrite a copy that differs from the bundled skill
+        #[arg(long)]
+        force: bool,
+    },
     /// Manage configuration (effective server, credential file)
     Config {
         #[command(subcommand)]
@@ -155,15 +164,19 @@ enum ConfigAction {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Die silently on SIGPIPE like a normal CLI (Rust ignores it by default,
-    // which turns `bbcli ... | head` into a panic).
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    // which turns `bbcli ... | head` into a panic). Unix-only: Windows has no
+    // SIGPIPE, and libc does not define it there, so an ungated call does not
+    // compile for a Windows target.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL)
+    };
 
     // Parse via raw matches so the flag-vs-env provenance of --context is
     // exact (clap records where a value came from) instead of reconstructed
     // by string-comparing the environment.
     let matches = Cli::command().get_matches();
-    let context_from_env =
-        matches.value_source("context") == Some(ValueSource::EnvVariable);
+    let context_from_env = matches.value_source("context") == Some(ValueSource::EnvVariable);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
@@ -206,6 +219,20 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::InstallSkill { dest, force } => {
+            match agent_skill::install(dest, force)? {
+                agent_skill::Installed::Written(path) => {
+                    println!("Installed the bytebase skill to {}.", path.display())
+                }
+                agent_skill::Installed::Unchanged(path) => {
+                    println!("{} is already up to date.", path.display())
+                }
+            }
+            println!(
+                "Re-run this after upgrading bbcli — the skill ships inside the binary, \
+                 so that is what keeps the installed copy in sync."
+            );
+        }
         Command::Login { r#as } => {
             let server = cli
                 .context
@@ -220,8 +247,7 @@ async fn main() -> Result<()> {
                 println!("Active context set to {}.", context.trim());
             }
             ConfigAction::Check => {
-                let (server, source) =
-                    resolve_server(cli.context.as_deref(), context_from_env)?;
+                let (server, source) = resolve_server(cli.context.as_deref(), context_from_env)?;
                 config_check(&server, &source, cli.insecure, cli.timeout).await?;
             }
             ConfigAction::Path => {
@@ -286,13 +312,12 @@ fn project_server_override() -> Option<String> {
 fn config_view(explicit: Option<&str>, from_env: bool) -> Result<()> {
     let cfg = store::load_config()?;
     let file = store::load()?;
-    let (effective, source) =
-        resolve_server(explicit, from_env).unwrap_or_else(|_| {
-            (
-                "-".to_string(),
-                "none: run `bbcli login --context <url>`".to_string(),
-            )
-        });
+    let (effective, source) = resolve_server(explicit, from_env).unwrap_or_else(|_| {
+        (
+            "-".to_string(),
+            "none: run `bbcli login --context <url>`".to_string(),
+        )
+    });
     println!("Effective server: {effective} (source: {source})");
     println!("Config file:      {}", store::config_path().display());
     println!("Credential file:  {}", store::token_path().display());
