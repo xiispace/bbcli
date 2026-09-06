@@ -48,7 +48,7 @@ Requires a Rust toolchain (1.75+); no other dependencies, and no network
 access to a Bytebase repo — the catalog is vendored.
 
 ```bash
-git clone https://github.com/<you>/bbcli && cd bbcli
+git clone https://github.com/xiispace/bbcli && cd bbcli
 cargo build --release
 install -m 755 target/release/bbcli /usr/local/bin/   # or anywhere on PATH
 ```
