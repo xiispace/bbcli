@@ -133,9 +133,14 @@ These are settled trade-offs, not gaps waiting to be filled.
 
 - **The resolver never picks for the agent.** A full
   `instances/{i}/databases/{d}` name skips the listing (one `GetDatabase`);
-  a short name lists with `name.contains` under `workspaces/-` (the catalog
-  documents `-` as the current workspace) and matches in tiers — exact, then
-  case-insensitive, then substring. More than one survivor is
+  a short name is listed with `name.contains` and matched in tiers — exact,
+  then case-insensitive, then substring. The listing parent is the concrete
+  `workspaces/{id}`, fetched with one `GetWorkspace` on `workspaces/-`:
+  `GetWorkspace` is the only method whose request documents that wildcard,
+  and a real server answers `permission_denied: workspace mismatch` when
+  `ListDatabases` is handed it — which reads to an agent like a missing role
+  rather than a malformed parent. Every hint that prints a listing command
+  spells the resolved id for the same reason. More than one survivor is
   `AMBIGUOUS_TARGET` with every candidate's full name, engine and project;
   bbcli does not choose, because a wrong guess runs SQL against a database
   nobody named. Data source preference is READ_ONLY over ADMIN, and the

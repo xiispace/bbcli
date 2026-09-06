@@ -124,8 +124,13 @@ Five steps from an empty machine to a first query:
 
    ```bash
    bbcli skill query                            # the full flow, offline
-   bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/-"}'
+   bbcli api WorkspaceService/GetWorkspace --args '{"name": "workspaces/-"}'
+   bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/<id>"}'
    ```
+
+   `workspaces/-` resolves to your own workspace on `GetWorkspace` only.
+   `ListDatabases` wants the concrete id and answers `workspace mismatch`
+   for the wildcard — which is why `query` and `schema` look it up first.
 
 ## Usage
 

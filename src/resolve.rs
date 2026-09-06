@@ -13,7 +13,7 @@ use std::fmt::Display;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::client::ApiClient;
 
@@ -81,9 +81,10 @@ pub fn tool_error(code: &str, msg: impl Display) -> anyhow::Error {
     anyhow::anyhow!("[{code}] {msg}")
 }
 
-/// The workspace parent for a listing. The catalog documents `-` as the
-/// current workspace, which is the only one a single credential can see.
-const WORKSPACE_PARENT: &str = "workspaces/-";
+/// The wildcard that resolves to the caller's own workspace. `GetWorkspace`
+/// is the *only* method documented to accept it, so it is the way to turn a
+/// credential into the concrete `workspaces/{id}` other methods want.
+const CURRENT_WORKSPACE: &str = "workspaces/-";
 
 /// Resolves `database` to exactly one database.
 ///
@@ -108,11 +109,15 @@ pub async fn resolve(
             serde_json::from_value(resp).context("failed to parse the GetDatabase response")?;
         from_entry(&entry)
     } else {
+        // Resolved here rather than inside the listing so a miss can name the
+        // parent it actually searched; an agent falling back to `api` needs
+        // the concrete workspace, which the `-` wildcard will not give it.
+        let parent = current_workspace(client).await?;
         let filter = build_database_filter(database, instance, project);
-        let entries = list_databases(client, &filter).await?;
+        let entries = list_databases(client, &parent, &filter).await?;
         let matches = match_databases(&entries, database);
         match matches.len() {
-            0 => return Err(not_found_error(database, instance, project)),
+            0 => return Err(not_found_error(database, instance, project, &parent)),
             1 => from_entry(matches[0]),
             _ => return Err(ambiguous_error(database, &matches)),
         }
@@ -134,13 +139,45 @@ pub async fn resolve(
     Ok(resolved)
 }
 
+/// The caller's own workspace, as `workspaces/{id}`.
+///
+/// A listing needs the concrete id: `ListDatabases` documents its parent as
+/// `workspaces/{id}` and a real server answers `permission_denied: workspace
+/// mismatch` for the `-` wildcard, which reads to an agent like a missing
+/// role rather than a malformed parent. `GetWorkspace` is where `-` is
+/// documented to work, so one call there buys the id for the listing.
+async fn current_workspace(client: &ApiClient) -> Result<String> {
+    let resp = client
+        .call_announced(
+            "WorkspaceService/GetWorkspace",
+            &json!({"name": CURRENT_WORKSPACE}),
+        )
+        .await
+        .context("resolving the current workspace")?;
+    resp.get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            tool_error(
+                "WORKSPACE_UNKNOWN",
+                "GetWorkspace returned no workspace name, so a database name cannot be \
+                 resolved\n  pass the full instances/{instance}/databases/{database} instead",
+            )
+        })
+}
+
 /// Pages through `ListDatabases` until the server stops handing out tokens.
-async fn list_databases(client: &ApiClient, filter: &str) -> Result<Vec<DatabaseEntry>> {
+async fn list_databases(
+    client: &ApiClient,
+    parent: &str,
+    filter: &str,
+) -> Result<Vec<DatabaseEntry>> {
     let mut all = Vec::new();
     let mut page_token = String::new();
     loop {
         let mut args = json!({
-            "parent": WORKSPACE_PARENT,
+            "parent": parent,
             "pageSize": 1000,
             "filter": filter,
         });
@@ -269,13 +306,24 @@ fn select_data_source(sources: &[DataSource]) -> String {
         .unwrap_or_default()
 }
 
-fn not_found_error(database: &str, instance: Option<&str>, project: Option<&str>) -> anyhow::Error {
+fn not_found_error(
+    database: &str,
+    instance: Option<&str>,
+    project: Option<&str>,
+    parent: &str,
+) -> anyhow::Error {
     let narrowed =
         instance.is_some_and(|s| !s.is_empty()) || project.is_some_and(|s| !s.is_empty());
     let hint = if narrowed {
-        "try without --instance/--project"
+        "try without --instance/--project".to_string()
     } else {
-        "list them with `bbcli api DatabaseService/ListDatabases --args '{\"parent\": \"workspaces/-\"}'`"
+        // The parent is spelled out because the `-` wildcard that resolved it
+        // is not accepted here: an agent copying this line gets a listing,
+        // not a `workspace mismatch`.
+        format!(
+            "list them with `bbcli api DatabaseService/ListDatabases \
+             --args '{{\"parent\": \"{parent}\"}}'`"
+        )
     };
     tool_error(
         "DATABASE_NOT_FOUND",
@@ -459,10 +507,16 @@ mod tests {
     /// exists, the many case lists what it found instead of choosing.
     #[test]
     fn refusals_name_every_candidate_or_the_way_to_list_them() {
-        let err = not_found_error("nope", None, None).to_string();
+        let err = not_found_error("nope", None, None, "workspaces/ws1").to_string();
         assert!(err.starts_with("[DATABASE_NOT_FOUND]"), "{err}");
         assert!(err.contains("ListDatabases"), "{err}");
-        let narrowed = not_found_error("nope", Some("prod"), None).to_string();
+        // The concrete workspace, not the wildcard that resolved it: a real
+        // server refuses `workspaces/-` here with `workspace mismatch`, so a
+        // hint spelling the wildcard sends the agent at a call that cannot
+        // work and reads like a missing role.
+        assert!(err.contains("workspaces/ws1"), "{err}");
+        assert!(!err.contains("workspaces/-"), "{err}");
+        let narrowed = not_found_error("nope", Some("prod"), None, "workspaces/ws1").to_string();
         assert!(
             narrowed.contains("try without --instance/--project"),
             "{narrowed}"

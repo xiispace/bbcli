@@ -57,6 +57,11 @@ def make_mock():
 
 # --- Fixtures for the friendly commands (query / schema / change) ----------
 #
+# The workspace a listing must be parented to. `workspaces/-` resolves to it
+# through GetWorkspace and is refused everywhere else, which is what the
+# resolver's extra lookup exists for.
+WORKSPACE = "workspaces/ws-test"
+#
 # Two databases whose short names both contain "emp", so "employee" resolves
 # by the exact tier while "emp" is genuinely ambiguous.
 DATABASES = [
@@ -244,11 +249,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"code": "unauthenticated", "message": "invalid token"})
                 return
             self._json(200, {"queryHistories": []})
+        elif self.path == "/bytebase.v1.WorkspaceService/GetWorkspace":
+            if not self.require_auth():
+                return
+            # Only the wildcard is answered: the real server accepts `-` here
+            # and this is the one call that turns a credential into an id.
+            assert json.loads(body).get("name") == "workspaces/-", body
+            self._json(200, {"name": WORKSPACE, "title": "Test workspace"})
         elif self.path == "/bytebase.v1.DatabaseService/ListDatabases":
             if not self.require_auth():
                 return
             msg = json.loads(body)
-            assert msg.get("parent") == "workspaces/-", msg
+            # The concrete workspace, never the `-` wildcard: a real server
+            # answers `permission_denied: workspace mismatch` for that here,
+            # so accepting it in the mock would hide the bug.
+            assert msg.get("parent") == WORKSPACE, msg
             self._json(200, {"databases": filter_databases(msg.get("filter", ""))})
         elif self.path == "/bytebase.v1.DatabaseService/GetDatabase":
             if not self.require_auth():
@@ -521,6 +536,9 @@ def main():
         assert result["latencyMs"] == 12, result
         # Every underlying call is attributable, exactly like `api`.
         assert f"DatabaseService/ListDatabases -> {base}" in out.stderr, out.stderr
+        # The workspace lookup that precedes it is announced too, so the whole
+        # chain stays reproducible with `api`.
+        assert f"WorkspaceService/GetWorkspace -> {base}" in out.stderr, out.stderr
         assert f"SQLService/Query -> {base}" in out.stderr, out.stderr
         assert 'resolved "employee" ->' in out.stderr, out.stderr
 
@@ -542,6 +560,7 @@ def main():
         assert json.loads(out.stdout)["rowCount"] == 1, out.stdout
         assert "DatabaseService/GetDatabase ->" in out.stderr, out.stderr
         assert "ListDatabases" not in out.stderr, out.stderr
+        assert "GetWorkspace" not in out.stderr, "a full name needs no workspace lookup"
 
         # The statement can come from stdin, like --args-file does for `api`.
         out = run_cli("query", "employee", "--file", "-", "--limit", "1", stdin="SELECT 1\n")

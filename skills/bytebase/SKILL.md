@@ -166,7 +166,7 @@ lowercase is Bytebase, uppercase is bbcli:
 | Code | What to do |
 |---|---|
 | `AMBIGUOUS_TARGET` | Several databases match. Add `--instance`/`--project`, or pass a full resource name from the listed candidates. Never pick one at random. |
-| `DATABASE_NOT_FOUND` | Nothing matched. List them: `bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/-"}'`. |
+| `DATABASE_NOT_FOUND` | Nothing matched. The error names the workspace it searched; list it with `bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/<id>"}'`. Get the id from `bbcli api WorkspaceService/GetWorkspace --args '{"name": "workspaces/-"}'` — the `-` wildcard works there and nowhere else. |
 | `TABLE_NOT_FOUND` | Re-run `bbcli schema <database>` without `--table` to see what exists; the error also lists near-miss candidates. |
 | `AMBIGUOUS_TABLE` | That table name exists in several schemas — add `--schema <one of the listed>`. |
 | `QUERY_ERROR` | The server ran the statement and it failed. Fix the SQL; do not retry unchanged. |
