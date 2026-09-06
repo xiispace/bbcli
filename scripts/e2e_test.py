@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -192,6 +193,46 @@ def browser_login(base, *extra_args):
     assert login.wait(timeout=10) == 0, "login exited nonzero"
 
 
+def paste_login(base, *extra_args):
+    """Login with no reachable loopback: the redirect URL is pasted on stdin.
+
+    Emulates the remote-host case -- the browser runs somewhere that cannot
+    reach this process's 127.0.0.1 listener, so the code arrives by copy and
+    paste instead of over the callback socket.
+    """
+    login = subprocess.Popen(
+        [BIN, "login", "--context", base, "--no-browser", *extra_args],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env(),
+    )
+    url = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        line = login.stderr.readline()
+        m = re.search(r"(https?://\S+authorize\S*)", line)
+        if m:
+            url = m.group(1)
+            break
+    assert url, "login never printed an authorization URL"
+
+    # Follow the consent redirect WITHOUT letting it reach the loopback
+    # listener -- exactly what a browser on another machine produces.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        opener.open(urllib.request.Request(url))
+        raise AssertionError("expected a 302 to the loopback callback")
+    except urllib.error.HTTPError as e:
+        redirect = e.headers["Location"]
+    assert "code=" in redirect and "state=" in redirect, redirect
+
+    out, err = login.communicate(redirect + "\n", timeout=10)
+    assert login.returncode == 0, f"paste login exited {login.returncode}: {err}"
+    return redirect
+
+
 def main():
     global TOKEN_FILE, MOCK_PORT
     server = make_mock()
@@ -222,6 +263,28 @@ def main():
         assert c["access_token"] == "at_1" and c["refresh_token"] == "rt_1", c
         assert c["expires_at"] > time.time(), c
         print("   ok: exchanged and stored at_1/rt_1")
+
+        # --- 1b) headless login: browser on another machine ---
+        step("login by pasting the redirect URL (no reachable loopback)")
+        os.remove(TOKEN_FILE)
+        redirect = paste_login(base)
+        c = load_tokens()
+        # The mock issues tokens sequentially, so pin the shape, not the value.
+        assert c["client_id"] == "bb_oauth_test", c
+        assert c["access_token"] and c["refresh_token"], c
+        assert c["expires_at"] > time.time(), c
+        # The same paste must not be replayable against a fresh login: its
+        # state belongs to the attempt that is now over.
+        os.remove(TOKEN_FILE)
+        stale = subprocess.run(
+            [BIN, "login", "--context", base, "--no-browser"],
+            input=redirect + "\n", capture_output=True, text=True, env=env(), timeout=15,
+        )
+        assert stale.returncode != 0, stale.stdout
+        assert "state mismatch" in stale.stderr.lower(), stale.stderr
+        assert not os.path.exists(TOKEN_FILE), "a stale paste must not store credentials"
+        browser_login(base)  # restore the credential the later steps expect
+        print("   ok: pasted redirect completes login; stale paste rejected")
 
         # --- 2) api ---
         step("api (Connect JSON direct call)")

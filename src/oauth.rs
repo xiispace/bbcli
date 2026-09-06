@@ -239,64 +239,205 @@ pub fn random_token(n_bytes: usize) -> String {
 /// Waits for the OAuth2 redirect on a loopback listener and returns the
 /// authorization code. Non-callback requests get a 404; error redirects and
 /// state mismatches abort the login.
-pub async fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String> {
+/// Waits for the authorization code, from whichever arrives first: the
+/// loopback callback, or a redirect URL pasted on stdin.
+///
+/// The two paths exist because the browser is not always on this machine.
+/// When it is, the callback lands on the listener and nothing is typed. When
+/// it is not — an agent on a remote box, a container, a machine reached over
+/// SSH — the browser redirects to `127.0.0.1:{port}` *there*, fails to
+/// connect, and leaves the code in the address bar; pasting that URL back
+/// completes the same exchange. Racing them means one `bbcli login` covers
+/// both without the user having to declare which situation they are in.
+///
+/// Pasting is not a weaker flow: the PKCE verifier never leaves this process,
+/// so the code alone cannot be redeemed, and `state` is checked identically
+/// on both paths.
+pub async fn wait_for_code(
+    listener: TcpListener,
+    expected_state: &str,
+    redirect_uri: &str,
+) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    // Reading stdin blocks, and in the common case — the browser is right
+    // here, the callback arrives on the socket — nobody ever types a line, so
+    // that read never returns. It therefore runs on a *detached* thread the
+    // runtime does not track: `spawn_blocking` would be tidier, but dropping
+    // the runtime waits for blocking tasks, and a task parked forever on
+    // stdin would hang every successful login at exit. A detached thread is
+    // simply abandoned when the process leaves.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_pasted_line());
+    });
+    // Taken once it resolves: a oneshot receiver must not be polled again,
+    // and after stdin is spent the listener is the only remaining source.
+    let mut rx = Some(rx);
     loop {
-        let (mut stream, _) = tokio::time::timeout_at(deadline, listener.accept())
-            .await
-            .map_err(|_| anyhow!("timed out waiting for the browser callback"))??;
-
-        let head = match read_http_head(&mut stream).await {
-            Ok(head) => head,
-            Err(_) => {
-                let _ = respond(&mut stream, "400 Bad Request", "Bad request", "").await;
-                continue;
+        tokio::select! {
+            received = async {
+                match rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                rx = None;
+                let line = match received {
+                    // Sender dropped without a value: stdin is unusable.
+                    Err(_) => continue,
+                    Ok(result) => result.context("failed to read the pasted URL")?,
+                };
+                let Some(line) = line else {
+                    continue; // stdin closed; the callback is still coming
+                };
+                let params = parse_pasted(&line, redirect_uri)?;
+                return match classify(&params, expected_state) {
+                    Callback::Code(code) => Ok(code),
+                    other => Err(other.into_error()),
+                };
             }
-        };
-        // Request line "GET /callback?... HTTP/1.1": parse the target as an
-        // absolute URL (the host is irrelevant) to get form-decoded pairs.
-        let target = head
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or_default();
-        let Ok(url) = reqwest::Url::parse(&format!("http://localhost{target}")) else {
-            let _ = respond(&mut stream, "400 Bad Request", "Bad request", "").await;
-            continue;
-        };
-        if url.path() != "/callback" {
-            let _ = respond(&mut stream, "404 Not Found", "Not found", "").await;
-            continue;
-        }
-        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+            accepted = tokio::time::timeout_at(deadline, listener.accept()) => {
+                let (mut stream, _) = accepted
+                    .map_err(|_| anyhow!("timed out waiting for the authorization code"))??;
 
-        if let Some(err) = params.get("error") {
-            let desc = params
-                .get("error_description")
-                .map(|d| format!(": {d}"))
-                .unwrap_or_default();
-            let _ = respond(&mut stream, "200 OK", "Authorization failed", err).await;
-            bail!("authorization failed: {err}{desc}");
+                let head = match read_http_head(&mut stream).await {
+                    Ok(head) => head,
+                    Err(_) => {
+                        let _ = respond(&mut stream, "400 Bad Request", "Bad request", "").await;
+                        continue;
+                    }
+                };
+                // Request line "GET /callback?... HTTP/1.1": parse the target as an
+                // absolute URL (the host is irrelevant) to get form-decoded pairs.
+                let target = head
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default();
+                let Ok(url) = reqwest::Url::parse(&format!("http://localhost{target}")) else {
+                    let _ = respond(&mut stream, "400 Bad Request", "Bad request", "").await;
+                    continue;
+                };
+                if url.path() != "/callback" {
+                    let _ = respond(&mut stream, "404 Not Found", "Not found", "").await;
+                    continue;
+                }
+                let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+
+                return match classify(&params, expected_state) {
+                    Callback::Code(code) => {
+                        let _ = respond(
+                            &mut stream,
+                            "200 OK",
+                            "Logged in",
+                            "You can close this tab and return to the terminal.",
+                        )
+                        .await;
+                        Ok(code)
+                    }
+                    Callback::Failed(err) => {
+                        let _ = respond(&mut stream, "200 OK", "Authorization failed", &err).await;
+                        Err(Callback::Failed(err).into_error())
+                    }
+                    Callback::StateMismatch => {
+                        let _ = respond(&mut stream, "400 Bad Request", "State mismatch", "").await;
+                        Err(Callback::StateMismatch.into_error())
+                    }
+                    Callback::MissingCode => {
+                        let _ = respond(&mut stream, "400 Bad Request", "Missing code", "").await;
+                        Err(Callback::MissingCode.into_error())
+                    }
+                };
+            }
         }
-        if params.get("state").map(String::as_str) != Some(expected_state) {
-            let _ = respond(&mut stream, "400 Bad Request", "State mismatch", "").await;
-            bail!("OAuth2 state mismatch on callback");
-        }
-        let Some(code) = params.get("code") else {
-            let _ = respond(&mut stream, "400 Bad Request", "Missing code", "").await;
-            bail!("callback carried no authorization code");
-        };
-        let _ = respond(
-            &mut stream,
-            "200 OK",
-            "Logged in",
-            "You can close this tab and return to the terminal.",
-        )
-        .await;
-        return Ok(code.clone());
     }
+}
+
+/// What the callback parameters turned out to be. Both the loopback listener
+/// and the pasted URL run through this, so neither can drift into accepting
+/// something the other rejects.
+enum Callback {
+    Code(String),
+    /// The server refused: `error` (plus `error_description`).
+    Failed(String),
+    StateMismatch,
+    MissingCode,
+}
+
+impl Callback {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Callback::Code(_) => anyhow!("not an error"),
+            Callback::Failed(err) => anyhow!("authorization failed: {err}"),
+            Callback::StateMismatch => anyhow!(
+                "OAuth2 state mismatch — the pasted URL or callback belongs to a different \
+                 login attempt; run `bbcli login` again and use the URL it prints"
+            ),
+            Callback::MissingCode => anyhow!("callback carried no authorization code"),
+        }
+    }
+}
+
+fn classify(params: &HashMap<String, String>, expected_state: &str) -> Callback {
+    if let Some(err) = params.get("error") {
+        let desc = params
+            .get("error_description")
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
+        return Callback::Failed(format!("{err}{desc}"));
+    }
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        return Callback::StateMismatch;
+    }
+    match params.get("code") {
+        Some(code) => Callback::Code(code.clone()),
+        None => Callback::MissingCode,
+    }
+}
+
+/// Reads one line from stdin, or `None` at EOF.
+fn read_pasted_line() -> Result<Option<String>> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("failed to read stdin")?;
+    Ok((n > 0).then_some(line))
+}
+
+/// Turns a pasted redirect into callback parameters.
+///
+/// Accepts the whole URL from the address bar, or just its query string. A
+/// bare code is rejected: without `state` there is nothing to bind the code
+/// to this login attempt, and the whole URL is what the address bar holds
+/// anyway — so asking for it costs the user nothing.
+fn parse_pasted(line: &str, redirect_uri: &str) -> Result<HashMap<String, String>> {
+    let text = line.trim();
+    if text.is_empty() {
+        bail!("no URL pasted");
+    }
+    let query = if let Ok(url) = reqwest::Url::parse(text) {
+        url.query().unwrap_or_default().to_string()
+    } else {
+        text.trim_start_matches(['?', '&']).to_string()
+    };
+    let params: HashMap<String, String> =
+        reqwest::Url::parse(&format!("http://localhost/?{query}"))
+            .map(|u| u.query_pairs().into_owned().collect())
+            .unwrap_or_default();
+    // A bare code parses as a single valueless key, not an empty map, so
+    // emptiness is not the test: the paste is only a redirect if it carries
+    // the parameter the server actually sends back.
+    if !params.contains_key("code") && !params.contains_key("error") {
+        bail!(
+            "pasted text is not a redirect URL. Copy the whole address the browser \
+             failed to open — it looks like {redirect_uri}?code=...&state=... — not just the code"
+        );
+    }
+    Ok(params)
 }
 
 /// Reads until the end of the HTTP request head (blank line). Only the head
@@ -345,6 +486,62 @@ pub fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REDIRECT: &str = "http://127.0.0.1:38123/callback";
+
+    /// The address bar holds the whole URL, which is what we ask for.
+    #[test]
+    fn pasted_full_url_yields_code() {
+        let params =
+            parse_pasted(&format!("  {REDIRECT}?code=abc&state=xyz  \n"), REDIRECT).unwrap();
+        match classify(&params, "xyz") {
+            Callback::Code(code) => assert_eq!(code, "abc"),
+            _ => panic!("expected a code"),
+        }
+    }
+
+    /// Some users copy only the query part; accept it rather than fail on a
+    /// difference that changes nothing about the checks that follow.
+    #[test]
+    fn pasted_bare_query_yields_code() {
+        for text in ["?code=abc&state=xyz", "code=abc&state=xyz"] {
+            let params = parse_pasted(text, REDIRECT).unwrap();
+            match classify(&params, "xyz") {
+                Callback::Code(code) => assert_eq!(code, "abc", "input {text:?}"),
+                _ => panic!("expected a code for {text:?}"),
+            }
+        }
+    }
+
+    /// A bare code carries no `state`, so nothing binds it to this login
+    /// attempt. Rejecting it is what keeps the pasted path as strong as the
+    /// loopback one.
+    #[test]
+    fn pasted_bare_code_is_rejected() {
+        let err = parse_pasted("4/0AeanS0abc", REDIRECT).unwrap_err().to_string();
+        assert!(err.contains("not just the code"), "{err}");
+    }
+
+    /// Both paths run the same checks, so a mismatched state fails alike.
+    #[test]
+    fn pasted_state_mismatch_is_caught() {
+        let params = parse_pasted(&format!("{REDIRECT}?code=abc&state=other"), REDIRECT).unwrap();
+        assert!(matches!(
+            classify(&params, "xyz"),
+            Callback::StateMismatch
+        ));
+    }
+
+    #[test]
+    fn server_error_is_surfaced_with_its_description() {
+        let params = parse_pasted(
+            &format!("{REDIRECT}?error=access_denied&error_description=user+said+no"),
+            REDIRECT,
+        )
+        .unwrap();
+        let err = classify(&params, "xyz").into_error().to_string();
+        assert!(err.contains("access_denied") && err.contains("user said no"), "{err}");
+    }
 
     #[test]
     fn pkce_pair_shape() {

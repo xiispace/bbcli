@@ -127,9 +127,37 @@ bbcli skill query                              # bundled task guide
 | `config use <name-or-url>` | Switch the active context (must already be logged in) |
 | `config check` | Verify connectivity and credentials; exits non-zero if unusable — usable as an agent/CI gate |
 | `config path` | Print the credential file path |
-| `login [--as <name>]` | OAuth2 login: RFC 7591 dynamic client registration → browser consent (PKCE S256) → token exchange; `--as` names the server as a context |
+| `login [--as <name>]` | OAuth2 login: RFC 7591 dynamic client registration → browser consent (PKCE S256) → token exchange, via the loopback callback or a pasted redirect URL; `--as` names the server as a context |
 | `status` | List stored credentials with access/refresh token expiry |
 | `logout` | Revoke the refresh token server-side and remove local credentials (drops contexts pointing at it) |
+
+## Logging in when the browser is elsewhere
+
+A remote box, a container, a machine reached over SSH: the browser cannot
+reach that host's `127.0.0.1`. No port forwarding needed — `bbcli login`
+accepts the redirect by paste, and takes whichever arrives first:
+
+```
+$ bbcli login --context https://bytebase.example.com --as prod
+Open this URL to authorize:
+  https://bytebase.example.com/api/oauth2/authorize?...
+
+If the browser is on another machine, open that URL there. The redirect to
+  http://127.0.0.1:38123/callback
+will fail to load — that is expected. Copy the full address from the browser's
+address bar and paste it here.
+
+Waiting up to 10 minutes for the callback or a pasted URL...
+```
+
+Open the URL in any browser, approve, and the browser lands on a page that
+fails to load. That failure is the point: the authorization code is in the
+address bar. Copy the whole address, paste it into the waiting prompt, done.
+
+This is not a weaker flow. The PKCE `code_verifier` never leaves the host
+running bbcli, so the pasted code cannot be redeemed by anyone who intercepts
+it, and `state` is checked exactly as it is on the loopback path. A bare code
+is rejected — paste the whole URL, which is what the address bar holds.
 
 ## Multiple servers (contexts)
 
@@ -170,7 +198,7 @@ URLs/ports instead.
 | `--context <name-or-url>` | api/login/logout | Context name or server base URL; env `BBCLI_SERVER` (a URL, for CI); otherwise the `.bbcli` file or the active context |
 | `--insecure` | all network | Accept invalid TLS certificates (self-signed deployments) |
 | `--timeout <seconds>` | api/config check | Fail the call after N seconds; env `BBCLI_TIMEOUT`. Unset by default — a client timeout does **not** cancel server-side work, so check the resource's status before retrying |
-| `--no-browser` | login | Print the authorization URL instead of opening a browser |
+| `--no-browser` | login | Print the authorization URL instead of opening a browser. Pasting the redirect works either way — see [Logging in when the browser is elsewhere](#logging-in-when-the-browser-is-elsewhere) |
 
 ## Storage
 
@@ -215,12 +243,9 @@ server go to stderr.
 
 ## Limitations
 
-- **Login needs a browser on the same host.** `--no-browser` prints the
-  authorization URL, but the redirect still lands on `http://127.0.0.1:<port>`
-  on the machine running bbcli. Over SSH, forward that port
-  (`ssh -L <port>:127.0.0.1:<port>`) and open the URL locally. There is no
-  headless machine-identity flow — bbcli targets interactive agents on a
-  workstation.
+- **Login needs a browser somewhere, and a person at it.** The browser does
+  not have to be on the same host (see below), but there is no unattended
+  machine-identity flow — bbcli targets interactive agents, not CI.
 - Unary RPCs only — Connect JSON streaming endpoints are not covered (rarely
   relevant for one-shot CLI commands).
 - The embedded catalog is a vendored snapshot (`vendor/bytebase/`), not the

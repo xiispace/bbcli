@@ -22,6 +22,11 @@ it fails with "not logged in" (or credentials are missing), ask the user to
 run once: `bbcli login --context <bytebase-url>` (add `--insecure` for
 self-signed TLS). Do not attempt to handle OAuth yourself.
 
+`login` is interactive and needs a person at a browser, so leave it to the
+user. If this host has no browser, tell them `bbcli login` prints an
+authorization URL they can open anywhere: the redirect fails to load and they
+paste that failed address back into the prompt. No port forwarding.
+
 `bbcli config view` shows the effective server and all logged-in ones; switch
 the default with `bbcli config use <url>`.
 

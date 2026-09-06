@@ -420,13 +420,23 @@ async fn login(server: &str, alias: Option<&str>, insecure: bool, no_browser: bo
     let url = client.authorize_url(&client_id, &redirect_uri, &state, &challenge);
 
     if no_browser {
-        eprintln!("Open this URL to authorize:\n  {url}\nWaiting for up to 10 minutes...");
+        eprintln!("Open this URL to authorize:\n  {url}\n");
     } else {
-        eprintln!("Opening browser for authorization:\n  {url}\nWaiting for up to 10 minutes...");
+        eprintln!("Opening browser for authorization:\n  {url}\n");
         oauth::open_browser(&url);
     }
+    // The browser is not always on this machine. Say up front how to finish
+    // the login when it is not, rather than leaving the user staring at a
+    // failed redirect and assuming bbcli is broken.
+    eprintln!(
+        "If the browser is on another machine, open that URL there. The redirect to\n  \
+         {redirect_uri}\n\
+         will fail to load — that is expected. Copy the full address from the browser's\n\
+         address bar and paste it here.\n\n\
+         Waiting up to 10 minutes for the callback or a pasted URL..."
+    );
 
-    let code = oauth::wait_for_code(listener, &state).await?;
+    let code = oauth::wait_for_code(listener, &state, &redirect_uri).await?;
     let creds = client
         .exchange_code(&client_id, &redirect_uri, &code, &verifier)
         .await?;
