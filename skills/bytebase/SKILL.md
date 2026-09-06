@@ -30,6 +30,72 @@ paste that failed address back into the prompt. No port forwarding.
 `bbcli config view` shows the effective server and all logged-in ones; switch
 the default with `bbcli config use <url>`.
 
+## Typical flows
+
+Three commands cover the common work and resolve the database themselves, so
+you never have to look up `instances/{instance}/databases/{database}` first.
+Pass the name the user says (`employee`), a substring of it, or the full
+resource name if you already have one.
+
+Inspect a schema, then read from it:
+
+```bash
+bbcli schema employee                  # tables, row counts, column counts
+bbcli schema employee --table orders   # one table: columns, indexes, foreign keys
+bbcli schema employee --include columns   # every table with its columns
+
+bbcli query employee 'SELECT count(*) FROM orders'
+bbcli query employee 'SELECT * FROM orders WHERE total > 100' --limit 500
+```
+
+`query` prints `{database, dataSourceId, columns, columnTypes, rows, rowCount,
+truncated, latencyMs}`. `truncated: true` means there were more rows than
+`--limit`; raise it or add a `WHERE`. Read `bbcli skill query` for the full
+flow, including how masked values must be presented.
+
+Propose a schema change — this creates a sheet, a plan, plan checks and an
+issue in one command:
+
+```bash
+bbcli change propose employee \
+  --sql 'ALTER TABLE orders ADD COLUMN note text' \
+  --title 'Add orders.note' --reason 'TICKET-1234'
+```
+
+Read `nextAction` in the output and stop there:
+
+| `nextAction` | What to do |
+|---|---|
+| `AWAIT_HUMAN_APPROVAL` | Stop. Give the user `links.issue` and let them approve. |
+| `CREATE_ROLLOUT` | Approved already: re-run with `--rollout`. |
+| `MONITOR_ROLLOUT` | The rollout exists; watch it with `bbcli api RolloutService/GetRollout`. |
+| `WAIT_PLAN_CHECK` | Checks were still running; re-run in a moment. |
+| `FIX_SQL_AND_RETRY` | A plan check failed or the issue was rejected — read `planChecks.results`. |
+
+Narrow an ambiguous database name with `--instance <id>` or `--project <id>`;
+both flags work on all three commands.
+
+Anything else — instances, environments, users, policies, rollouts — goes
+through `api`:
+
+```bash
+bbcli search --service InstanceService
+bbcli api InstanceService/GetInstance --args '{"name": "instances/e1"}'
+```
+
+## Rules
+
+- **One statement per `query` call.** Extra result sets are dropped with a
+  note on stderr; send separate calls instead.
+- **Never approve an issue on the user's behalf.** `AWAIT_HUMAN_APPROVAL`
+  means stop and hand `links.issue` to the user — do not call `ApproveIssue`.
+- **`created so far:` in an error is a list of real resources.** `change
+  propose` rolls nothing back, so those sheets and plans still exist: reuse
+  them or tell the user to clean them up, but do not assume a retry starts
+  from nothing.
+- **Never guess a resource name.** If a command cannot resolve one, list the
+  collection with `api` rather than inventing a name.
+
 ## Discover APIs (offline, no server)
 
 ```bash
@@ -72,40 +138,6 @@ Read the relevant guide before attempting a multi-step task. Guides are
 written in MCP tool syntax; `bbcli skill <name>` prints the MCP→bbcli command
 translation at the top of every guide.
 
-## Typical flows
-
-Run a query. The database must be located first — resource names are
-`instances/{instance}/databases/{database}` and cannot be guessed:
-
-```bash
-bbcli api DatabaseService/ListDatabases --args '{
-  "parent": "workspaces/-",
-  "filter": "name.contains(\"employee\")"
-}'
-# pick `name` from the response; take dataSourceId from
-# instanceResource.dataSources, preferring type READ_ONLY over ADMIN
-
-bbcli api DatabaseService/GetDatabaseMetadata --args '{
-  "name": "instances/e1/databases/db/metadata"
-}'                                    # inspect the schema before writing SQL
-
-bbcli api SQLService/Query --args '{
-  "name": "instances/e1/databases/db",
-  "dataSourceId": "<id>",
-  "statement": "SELECT 1"
-}'
-```
-
-Read `bbcli skill query` for the full flow, including how masked values must
-be presented.
-
-Find and call any API:
-
-```bash
-bbcli search --service InstanceService
-bbcli api InstanceService/GetInstance --args '{"name": "instances/e1"}'
-```
-
 ## Server selection
 
 `--context <name-or-url>` (or env `BBCLI_SERVER`) for one command — names come
@@ -127,11 +159,26 @@ next step, so read it rather than the prose:
 | `unimplemented` | The server is older or newer than the embedded catalog (`bbcli --version`). |
 | `unavailable`, `deadline_exceeded` | Transient; retrying may work. |
 
+`query`, `schema` and `change propose` can also refuse before reaching the
+server. Those codes are UPPER_SNAKE, so the case tells you who refused —
+lowercase is Bytebase, uppercase is bbcli:
+
+| Code | What to do |
+|---|---|
+| `AMBIGUOUS_TARGET` | Several databases match. Add `--instance`/`--project`, or pass a full resource name from the listed candidates. Never pick one at random. |
+| `DATABASE_NOT_FOUND` | Nothing matched. List them: `bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/-"}'`. |
+| `TABLE_NOT_FOUND` | Re-run `bbcli schema <database>` without `--table` to see what exists; the error also lists near-miss candidates. |
+| `AMBIGUOUS_TABLE` | That table name exists in several schemas — add `--schema <one of the listed>`. |
+| `QUERY_ERROR` | The server ran the statement and it failed. Fix the SQL; do not retry unchanged. |
+| `SHEET_CREATE_FAILED`, `PLAN_CREATE_FAILED`, `ISSUE_CREATE_FAILED` | Read the Connect code quoted inside the message — that is the real cause. Anything under `created so far:` already exists; do not recreate it. |
+
 - `invalid_grant` on refresh: the 30-day refresh token expired or was revoked —
   the user must re-run `bbcli login`. `bbcli status` distinguishes an expired
   access token (self-healing) from an expired refresh token (needs re-login).
-- Every `api` call prints `Method -> server (source: ...)` on stderr. Check it
-  when a multi-step task must stay on one environment; stdout is pure JSON.
+- Every call prints `Method -> server (source: ...)` on stderr — including
+  each underlying call a friendly command makes, so you can see which methods
+  to reach for with `api`. Check it when a multi-step task must stay on one
+  environment; stdout is pure JSON on success and empty on failure.
 - `--insecure` only helps with TLS failures, not auth ones.
 - There is no request deadline by default, because queries and rollouts can
   run for minutes. Pass `--timeout <seconds>` to bound an unattended run — but

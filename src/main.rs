@@ -6,8 +6,12 @@
 //! Code, ...) — pair with the agent skill in `skills/bytebase/SKILL.md`.
 
 mod agent_skill;
+mod change;
 mod client;
 mod oauth;
+mod query;
+mod resolve;
+mod schema;
 mod search;
 mod store;
 
@@ -27,9 +31,15 @@ Note: this guide uses MCP tool syntax. Equivalent bbcli commands:
   search_api(operationId=\"S/M\")            -> bbcli search --operation-id S/M
   search_api(schema=\"T\")                   -> bbcli search --schema T
   call_api(operationId=\"S/M\", body={...})  -> bbcli api S/M --args '<same fields, as JSON>'
-  get_schema(database=\"instances/i/databases/db\")
-                                            -> bbcli api DatabaseService/GetDatabaseMetadata \\
-                                               --args '{\"name\": \"instances/i/databases/db/metadata\"}'
+  query_database(database=, statement=, ...)
+                                            -> bbcli query <database> '<statement>' \\
+                                               [--instance I] [--project P] [--limit N]
+  get_schema(database=, schema=, table=, include=)
+                                            -> bbcli schema <database> [--schema S] [--table T] \\
+                                               [--include summary|columns|details]
+  propose_database_change(database=, sql=, title=, ...)
+                                            -> bbcli change propose <database> --sql '...' \\
+                                               --title '...' [--rollout] [--reason '...']
 ---- guide follows ----";
 
 /// Task guides embedded from `backend/api/mcp/skills/` (same content the MCP
@@ -61,7 +71,7 @@ const VERSION: &str = concat!(
     name = "bbcli",
     version = VERSION,
     about = "CLI for a Bytebase server with OAuth2 auto-refresh",
-    after_help = "Log in once with `bbcli login --context <url>`, then:\n  bbcli search --service SQLService\n  bbcli api SQLService/Query --args '{\"name\": \"instances/e1/databases/db\", \"statement\": \"SELECT 1\"}'"
+    after_help = "Log in once with `bbcli login --context <url>`, then:\n  bbcli query employee 'SELECT 1'\n  bbcli schema employee\n  bbcli search --service SQLService\n  bbcli api SQLService/Query --args '{\"name\": \"instances/e1/databases/db\", \"statement\": \"SELECT 1\"}'"
 )]
 struct Cli {
     /// Context name or server base URL; the BBCLI_SERVER env sets the same
@@ -88,6 +98,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run one read-only SQL statement, resolving the database by name
+    /// (mirrors the MCP query_database tool)
+    Query {
+        /// Database: a name, a substring of one, or the full
+        /// instances/{instance}/databases/{database}
+        database: String,
+        /// The SQL statement — one statement per call. Quote it for the shell
+        statement: Option<String>,
+        /// Read the statement from a file, or "-" for stdin
+        #[arg(long, conflicts_with = "statement")]
+        file: Option<String>,
+        /// Narrow resolution to one instance: an id or instances/{id}
+        #[arg(long)]
+        instance: Option<String>,
+        /// Narrow resolution to one project: an id or projects/{id}
+        #[arg(long)]
+        project: Option<String>,
+        /// Maximum rows to return; `truncated` in the output says whether
+        /// there were more
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
+    /// Inspect a database's schema: tables, columns, indexes, foreign keys
+    /// (mirrors the MCP get_schema tool)
+    Schema {
+        /// Database: a name, a substring of one, or the full
+        /// instances/{instance}/databases/{database}
+        database: String,
+        /// Narrow resolution to one instance: an id or instances/{id}
+        #[arg(long)]
+        instance: Option<String>,
+        /// Narrow resolution to one project: an id or projects/{id}
+        #[arg(long)]
+        project: Option<String>,
+        /// Limit to one schema (PostgreSQL, MSSQL, Oracle, ...); ignored with
+        /// a note on engines without named schemas, such as MySQL
+        #[arg(long)]
+        schema: Option<String>,
+        /// Drill into one table by name; implies --include details
+        #[arg(long)]
+        table: Option<String>,
+        /// Detail per table [default: summary, or details with --table]
+        #[arg(long, value_enum)]
+        include: Option<schema::Include>,
+    },
+    /// Propose a database change through the review flow
+    Change {
+        #[command(subcommand)]
+        action: ChangeAction,
+    },
     /// Call a Bytebase API method, e.g. SQLService/Query
     Api {
         /// Method as Service/Method (or bytebase.v1.Service/Method)
@@ -147,6 +207,41 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ChangeAction {
+    /// Create sheet -> plan -> plan checks -> issue for one database, and a
+    /// rollout only with --rollout (mirrors the MCP propose_database_change
+    /// tool). Nothing is approved on your behalf
+    #[command(group(clap::ArgGroup::new("sql_source").required(true).args(["sql", "file"])))]
+    Propose {
+        /// Database: a name, a substring of one, or the full
+        /// instances/{instance}/databases/{database}
+        database: String,
+        /// The SQL to apply, in plain text (DDL or DML)
+        #[arg(long)]
+        sql: Option<String>,
+        /// Read the SQL from a file, or "-" for stdin
+        #[arg(long, conflicts_with = "sql")]
+        file: Option<String>,
+        /// Title for the plan and the issue; what reviewers see first
+        #[arg(long)]
+        title: String,
+        /// Narrow resolution to one instance: an id or instances/{id}
+        #[arg(long)]
+        instance: Option<String>,
+        /// Narrow resolution to one project: an id or projects/{id}
+        #[arg(long)]
+        project: Option<String>,
+        /// Also create the rollout, if plan checks and approval allow it;
+        /// the output's rolloutDeferredReason says why not when they do not
+        #[arg(long)]
+        rollout: bool,
+        /// Context or ticket reference; becomes the issue description
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Show the effective server (and where it comes from) plus all logged-in servers
     View,
@@ -177,8 +272,9 @@ async fn main() -> Result<()> {
     // by string-comparing the environment.
     let matches = Cli::command().get_matches();
     let context_from_env = matches.value_source("context") == Some(ValueSource::EnvVariable);
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let Some(command) = cli.command else {
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Taken out so the global flags stay borrowable while the subcommand runs.
+    let Some(command) = cli.command.take() else {
         Cli::command().print_help()?;
         return Ok(());
     };
@@ -188,18 +284,98 @@ async fn main() -> Result<()> {
             args,
             args_file,
         } => {
-            let (server, source) = resolve_server(cli.context.as_deref(), context_from_env)?;
-            // The target is implicit (flag, env, .bbcli file, or the global
-            // default), and a multi-step agent run has no other cheap way to
-            // confirm it hit the environment it meant to. Announce it on
-            // stderr so every call is attributable while stdout stays pure
-            // JSON for piping.
-            eprintln!("{method} -> {server} (source: {source})");
-            let client = ApiClient::load(&server, cli.insecure, cli.timeout)?;
+            let client = api_client(&cli, context_from_env)?;
             let args = read_args(&args, &args_file)?;
-            let result = client.call(&method, &args).await?;
+            // `call_announced` prints the `Method -> server (source: ...)`
+            // line: the target is implicit (flag, env, .bbcli file, or the
+            // global default), and a multi-step agent run has no other cheap
+            // way to confirm it hit the environment it meant to. It goes to
+            // stderr so stdout stays pure JSON for piping.
+            let result = client.call_announced(&method, &args).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::Query {
+            database,
+            statement,
+            file,
+            instance,
+            project,
+            limit,
+        } => {
+            let client = api_client(&cli, context_from_env)?;
+            // Validated here rather than with a required clap group: the
+            // group makes the usage line read `<STATEMENT|--file> <DATABASE>`,
+            // which tells an agent to put the SQL first.
+            let statement = match (statement, &file) {
+                (Some(s), _) => s,
+                (None, Some(path)) => read_text(path)?,
+                (None, None) => {
+                    bail!("give the SQL statement after the database, or --file <path|->")
+                }
+            };
+            let result = query::run(
+                &client,
+                &database,
+                &statement,
+                instance.as_deref(),
+                project.as_deref(),
+                limit,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Schema {
+            database,
+            instance,
+            project,
+            schema,
+            table,
+            include,
+        } => {
+            let client = api_client(&cli, context_from_env)?;
+            let result = schema::run(
+                &client,
+                &database,
+                instance.as_deref(),
+                project.as_deref(),
+                schema.as_deref(),
+                table.as_deref(),
+                include,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Change { action } => match action {
+            ChangeAction::Propose {
+                database,
+                sql,
+                file,
+                title,
+                instance,
+                project,
+                rollout,
+                reason,
+            } => {
+                let client = api_client(&cli, context_from_env)?;
+                let sql = match (sql, &file) {
+                    (Some(s), _) => s,
+                    (None, Some(path)) => read_text(path)?,
+                    (None, None) => unreachable!("clap requires --file or --sql"),
+                };
+                let result = change::propose(
+                    &client,
+                    &database,
+                    &sql,
+                    &title,
+                    instance.as_deref(),
+                    project.as_deref(),
+                    rollout,
+                    reason.as_deref(),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        },
         Command::Search {
             service,
             operation_id,
@@ -262,6 +438,14 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Builds the client every server-touching command needs: resolve the target,
+/// then load its credentials. The resolved source travels with the client so
+/// each call announces where it went, `api` and the friendly subcommands alike.
+fn api_client(cli: &Cli, context_from_env: bool) -> Result<ApiClient> {
+    let (server, source) = resolve_server(cli.context.as_deref(), context_from_env)?;
+    ApiClient::load(&server, &source, cli.insecure, cli.timeout)
 }
 
 /// Picks the server. Precedence: `--context`/`BBCLI_SERVER` (a context name or
@@ -361,7 +545,7 @@ async fn config_check(
     insecure: bool,
     timeout: Option<u64>,
 ) -> Result<()> {
-    let client = ApiClient::load(server, insecure, timeout)?;
+    let client = ApiClient::load(server, source, insecure, timeout)?;
 
     // Connectivity and version banner (auth-exempt endpoint).
     let info = client
@@ -389,21 +573,25 @@ async fn config_check(
     Ok(())
 }
 
+/// Reads a payload from a file, or from stdin for `-`. Shared by every
+/// `--file` / `--args-file` flag so `-` means the same thing everywhere.
+fn read_text(path: &str) -> Result<String> {
+    use std::io::Read;
+    if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut buf)
+            .context("failed to read from stdin")?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))
+}
+
 /// Resolves request fields from --args / --args-file into a JSON object.
 fn read_args(args: &str, args_file: &Option<String>) -> Result<Value> {
-    use std::io::Read;
     let raw = match args_file {
-        Some(path) if path == "-" => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .lock()
-                .read_to_string(&mut buf)
-                .context("failed to read args from stdin")?;
-            buf
-        }
-        Some(path) => {
-            std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?
-        }
+        Some(path) => read_text(path)?,
         None => args.to_string(),
     };
     let value: Value =

@@ -34,12 +34,23 @@ pub struct ApiClient {
     /// them off would be worse than waiting. Unattended agents that need a
     /// bounded run set one explicitly (`--timeout`, `BBCLI_TIMEOUT`).
     timeout: Option<std::time::Duration>,
+    /// Where the server came from (`--context flag`, `env BBCLI_SERVER`, a
+    /// `.bbcli` file, the default context). Only used for the attribution
+    /// line, but it lives here so every call site formats that line the same
+    /// way instead of re-threading the provenance through each command.
+    source: String,
     creds: Mutex<Credentials>,
 }
 
 impl ApiClient {
-    /// Loads credentials for `server` from the shared token file.
-    pub fn load(server: &str, insecure: bool, timeout_secs: Option<u64>) -> Result<Self> {
+    /// Loads credentials for `server` from the shared token file. `source`
+    /// names where the server came from, for the per-call attribution line.
+    pub fn load(
+        server: &str,
+        source: &str,
+        insecure: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Self> {
         let key = store::normalize(server);
         let creds = store::get(server)?
             .ok_or_else(|| anyhow!("not logged in to {key}; {}", store::login_hint(&key)))?;
@@ -47,9 +58,37 @@ impl ApiClient {
         Ok(Self {
             http: oauth.http.clone(),
             timeout: timeout_secs.map(std::time::Duration::from_secs),
+            source: source.to_string(),
             oauth,
             creds: Mutex::new(creds),
         })
+    }
+
+    /// The resolved server base URL, without a trailing slash.
+    pub fn server(&self) -> &str {
+        &self.oauth.server
+    }
+
+    /// `call`, preceded by the attribution line on stderr.
+    ///
+    /// The target is implicit (flag, env, `.bbcli` file, or the default
+    /// context), and a multi-step agent run has no other cheap way to confirm
+    /// it hit the environment it meant to. Every command that reaches the
+    /// server goes through here — including each hop of a friendly subcommand,
+    /// so the `api` escape hatch stays learnable from the trace — and stdout
+    /// stays pure JSON for piping.
+    pub async fn call_announced(&self, method: &str, args: &Value) -> Result<Value> {
+        self.announce(method);
+        self.call(method, args).await
+    }
+
+    /// The attribution line for `method`, without the call. For a poll loop,
+    /// which announces its method once rather than once per tick.
+    pub fn announce(&self, method: &str) {
+        eprintln!(
+            "{method} -> {} (source: {})",
+            self.oauth.server, self.source
+        );
     }
 
     /// Calls `Service/Method` (or `bytebase.v1.Service/Method`) with the given

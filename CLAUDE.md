@@ -11,6 +11,11 @@ Layout: `src/main.rs` (clap dispatch) → `src/client.rs` (Connect calls, token
 refresh) ← `src/oauth.rs` (registration, PKCE, token exchange) +
 `src/store.rs` (locked credential/config files). `src/search.rs` reads the
 embedded OpenAPI catalog; `src/agent_skill.rs` installs the embedded skill.
+The friendly subcommands live one per file, each mirroring the upstream MCP
+tool it stands in for: `src/resolve.rs` (database short name → resource name
++ data source; shared), `src/query.rs` (`query_database`), `src/schema.rs`
+(`get_schema`), `src/change.rs` (`propose_database_change`). They compose
+`client::ApiClient` calls and never speak HTTP themselves.
 
 ## Design constraints (do not revisit without discussion)
 
@@ -55,6 +60,28 @@ These are settled trade-offs, not gaps waiting to be filled.
   when a second host actually needs different skill *content*, not merely a
   different path.
 
+- **Friendly subcommands must earn their place.** `bbcli api` reaches every
+  method, so a dedicated subcommand has to prove it is not the same call with
+  renamed flags. Add one only when at least one of these holds:
+  (a) it chains two or more API calls and threads state between them
+  (`change propose`: sheet → plan → plan checks → issue → rollout);
+  (b) it reshapes a response the model cannot read economically (`query`
+  flattens `RowValue` oneofs; `schema` summarises and truncates metadata);
+  (c) it resolves a resource name the model would otherwise look up on every
+  task (database short name → `instances/{i}/databases/{d}` + `dataSourceId`).
+  A single-call wrapper fails all three — `list-databases`, `get-issue` and
+  their kin are `bbcli api`. Two hard rules for the ones that qualify: their
+  parameter names mirror the upstream MCP tool they stand in for
+  (`query_database`, `get_schema`, `propose_database_change`), so the vendored
+  guides read without translation; and every underlying call prints the same
+  `Method -> server (source: ...)` line `api` does, so the escape hatch stays
+  learnable and an agent can always fall back to it. Where upstream's MCP
+  server found `call_api` sufficient, so does bbcli — `grant-permission` stays
+  a guide. The burden of proof is on the new subcommand. There is also no
+  second argument syntax (`--arg k=v`): request bodies nest
+  (`plan.specs[].changeDatabaseConfig.targets`), and `--args` /
+  `--args-file -` already take JSON.
+
 ## Non-obvious invariants
 
 - **The refresh race.** `store::edit_tokens` holds the token file's exclusive
@@ -93,6 +120,62 @@ These are settled trade-offs, not gaps waiting to be filled.
   decides the next action (re-login / fix fields / request access / retry), so
   `client::recovery_hint` maps each code to the one action that resolves it.
   An agent should never have to infer intent from prose.
+
+- **Two families of error codes, told apart by case.** Connect codes from the
+  server stay lowercase (`[permission_denied]`) and pass through
+  `client::call` unchanged. Codes the friendly subcommands raise themselves
+  are UPPER_SNAKE and named after upstream's (`[AMBIGUOUS_TARGET]`,
+  `[DATABASE_NOT_FOUND]`, `[TABLE_NOT_FOUND]`, `[AMBIGUOUS_TABLE]`,
+  `[QUERY_ERROR]`, `[SHEET_CREATE_FAILED]`, `[PLAN_CREATE_FAILED]`,
+  `[ISSUE_CREATE_FAILED]`). The case tells the agent who refused: bbcli's own
+  resolution, or the server. Both go to stderr with exit 1; stdout stays
+  JSON-on-success only.
+
+- **The resolver never picks for the agent.** A full
+  `instances/{i}/databases/{d}` name skips the listing (one `GetDatabase`);
+  a short name lists with `name.contains` under `workspaces/-` (the catalog
+  documents `-` as the current workspace) and matches in tiers — exact, then
+  case-insensitive, then substring. More than one survivor is
+  `AMBIGUOUS_TARGET` with every candidate's full name, engine and project;
+  bbcli does not choose, because a wrong guess runs SQL against a database
+  nobody named. Data source preference is READ_ONLY over ADMIN, and the
+  chosen id is part of the output so the agent can hand it to `api`.
+
+- **`query` asks for `limit + 1` rows and trims to `limit`.** That is what
+  makes `truncated` exact instead of "maybe", and it bounds the payload. Only
+  the first result set is flattened — one statement per call is the
+  contract; extra result sets are announced on stderr rather than silently
+  dropped or allowed to change the output shape. `int64`/`uint64` arrive as
+  protojson strings and become JSON numbers only when they fit (`serde_json`
+  holds i64/u64 exactly); timestamps collapse to the UTC RFC 3339 string in
+  `googleTimestamp`, dropping zone and offset because the instant is the
+  unambiguous value. A `QueryResult.error` inside a 200 response is a
+  failure (`QUERY_ERROR`), not a result.
+
+- **`schema` picks detail client-side and truncates server-side.**
+  `--include` defaults to `summary`, or `details` when `--table` is given. In
+  `columns`/`details` bulk modes it asks the server for 201 tables per schema
+  and trims to 200, so `truncated` is exact (the `query` trick again);
+  `summary` is uncapped because the per-table payload is tiny and a silent
+  cap would hide tables. The multi-schema engine list is client-side and
+  copied from upstream: on MySQL-family engines `--schema` is dropped with a
+  stderr note, because the server applies `schema == "x"` as an exact match
+  and would return zero tables. Primary-key columns come from the index with
+  `primary: true`; `ColumnMetadata` has no such flag.
+
+- **`change propose` leaves what it created.** The sequence is CreateSheet →
+  CreatePlan → RunPlanChecks (its failure is ignored: CreatePlan already
+  starts checks server-side) → poll `GetPlanCheckRun` for at most 10 s (announced once, not per tick:
+  ten identical attribution lines would bury the trace) →
+  CreateIssue → CreateRollout only with `--rollout` and only when checks and
+  approval allow it. A failure at any step names every resource created so
+  far (`created so far: sheet=..., plan=...`) and cleans up nothing — the
+  agent or a human decides. `nextAction` is one of `AWAIT_HUMAN_APPROVAL`,
+  `CREATE_ROLLOUT`, `MONITOR_ROLLOUT`, `WAIT_PLAN_CHECK`, `FIX_SQL_AND_RETRY`
+  and never names `ApproveIssue`: the agent does not approve on the user's
+  behalf. There is no change-type flag: the server detects MIGRATE vs SDL
+  from the sheet content, and upstream's `changeType` parameter is echoed
+  but unused.
 
 - **Field descriptions print with their continuation lines.** proto3 has no
   `required`, so the resource-name formats and constraints an agent must not

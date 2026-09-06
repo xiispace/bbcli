@@ -7,6 +7,10 @@ handlers. Covers, in order:
   1. login: RFC 7591 registration -> PKCE authorize redirect -> loopback
      callback -> authorization-code exchange -> token file written
   2. api: direct Connect call, args and --args-file, error propagation
+  2a. friendly commands: query / schema / change propose -- database
+      resolution (tiered, ambiguous, full resource name), row flattening and
+      truncation, schema summary vs table drill-down, and the
+      sheet->plan->checks->issue->rollout chain with its rollout gates
   2b. config: view / use / check / path
   2c. contexts: named logins (--as), alias resolution everywhere, project
       .bbcli files, and precedence between them
@@ -20,6 +24,7 @@ handlers. Covers, in order:
 Usage: python3 scripts/e2e_test.py [path-to-bbcli]
 """
 
+import base64
 import json
 import os
 import re
@@ -40,8 +45,103 @@ MOCK_PORT = 0
 def make_mock():
     """A mock Bytebase server with its own rotating credential state."""
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    httpd.state = {"access": None, "refresh": None, "n": 0, "refresh_calls": 0}
+    httpd.state = {
+        "access": None, "refresh": None, "n": 0, "refresh_calls": 0,
+        # Approval the mock hands back from CreateIssue, and the sheet content
+        # it last received -- the rollout gates and the base64 encoding are
+        # asserted against these.
+        "approval": "PENDING", "sheet_content": None,
+    }
     return httpd
+
+
+# --- Fixtures for the friendly commands (query / schema / change) ----------
+#
+# Two databases whose short names both contain "emp", so "employee" resolves
+# by the exact tier while "emp" is genuinely ambiguous.
+DATABASES = [
+    {
+        "name": "instances/pg1/databases/employee",
+        "project": "projects/hr",
+        "instanceResource": {
+            "name": "instances/pg1",
+            "engine": "POSTGRES",
+            # ADMIN first on purpose: the resolver must still pick READ_ONLY.
+            "dataSources": [{"id": "admin", "type": "ADMIN"}, {"id": "ro", "type": "READ_ONLY"}],
+        },
+    },
+    {
+        "name": "instances/my1/databases/employee_archive",
+        "project": "projects/hr",
+        "instanceResource": {
+            "name": "instances/my1",
+            "engine": "MYSQL",
+            "dataSources": [{"id": "admin", "type": "ADMIN"}],
+        },
+    },
+]
+
+TABLES = {
+    "orders": {
+        "name": "orders",
+        # int64 on the wire may be a string; the CLI must emit a number.
+        "rowCount": "42",
+        "columns": [
+            {"name": "id", "type": "int", "nullable": False},
+            {"name": "total", "type": "numeric", "nullable": True, "default": "0"},
+        ],
+        "indexes": [{"name": "orders_pkey", "expressions": ["id"], "type": "btree",
+                     "unique": True, "primary": True}],
+        "foreignKeys": [{"name": "orders_user_fk", "columns": ["id"],
+                         "referencedTable": "users", "referencedColumns": ["id"]}],
+    },
+    "users": {
+        "name": "users",
+        "rowCount": 7,
+        "columns": [
+            {"name": "id", "type": "int", "nullable": False},
+            {"name": "email", "type": "text", "nullable": True},
+        ],
+    },
+}
+
+
+def cel_arg(filt, pattern):
+    """The quoted argument of one CEL term, or None."""
+    m = re.search(pattern, filt or "")
+    return m.group(1) if m else None
+
+
+def filter_databases(filt):
+    """Substring on name plus exact instance/project, like the real server."""
+    needle = cel_arg(filt, r'name\.contains\("([^"]*)"\)') or ""
+    out = [d for d in DATABASES if needle in d["name"]]
+    instance = cel_arg(filt, r'instance == "([^"]*)"')
+    if instance:
+        out = [d for d in out if d["instanceResource"]["name"] == instance]
+    project = cel_arg(filt, r'project == "([^"]*)"')
+    if project:
+        out = [d for d in out if d["project"] == project]
+    return out
+
+
+def metadata_response(name, filt):
+    table = cel_arg(filt, r'table == "([^"]*)"')
+    tables = [t for t in TABLES.values() if table is None or t["name"] == table]
+    return {"name": name, "schemas": [{
+        "name": "public",
+        "tables": tables,
+        "views": [{"name": "v_orders"}],
+    }]}
+
+
+def query_rows(n):
+    """n identical rows exercising the int64/string/timestamp variants."""
+    return [{"values": [
+        {"int64Value": "1"},
+        {"stringValue": "a"},
+        {"timestampValue": {"googleTimestamp": "2026-01-01T00:00:00Z", "accuracy": 6}},
+    ]} for _ in range(n)]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,6 +175,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def authed(self):
         return self.headers.get("Authorization") == f"Bearer {self.server.state['access']}"
+
+    def require_auth(self):
+        """Answers 401 and reports False when the bearer token is not current."""
+        if self.authed():
+            return True
+        self._json(401, {"code": "unauthenticated", "message": "invalid token"})
+        return False
 
     def do_POST(self):
         state = self.server.state
@@ -137,6 +244,95 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"code": "unauthenticated", "message": "invalid token"})
                 return
             self._json(200, {"queryHistories": []})
+        elif self.path == "/bytebase.v1.DatabaseService/ListDatabases":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            assert msg.get("parent") == "workspaces/-", msg
+            self._json(200, {"databases": filter_databases(msg.get("filter", ""))})
+        elif self.path == "/bytebase.v1.DatabaseService/GetDatabase":
+            if not self.require_auth():
+                return
+            name = json.loads(body).get("name", "")
+            match = next((d for d in DATABASES if d["name"] == name), None)
+            if match is None:
+                self._json(404, {"code": "not_found", "message": f"no database {name}"})
+            else:
+                self._json(200, match)
+        elif self.path == "/bytebase.v1.SQLService/Query":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            if msg["name"] == "instances/pg1/databases/employee":
+                assert msg.get("dataSourceId") == "ro", msg
+            assert msg.get("limit"), f"the CLI must bound the result set: {msg}"
+            if "bad" in msg["statement"]:
+                # A failed statement inside a 200: the Connect call worked.
+                self._json(200, {"results": [{"error": "syntax error near bad"}]})
+                return
+            self._json(200, {"results": [{
+                "columnNames": ["id", "name", "ts"],
+                "columnTypeNames": ["INT", "TEXT", "TIMESTAMP"],
+                # Exactly as many rows as asked for, so the CLI's limit+1
+                # request is what decides `truncated`.
+                "rows": query_rows(msg["limit"]),
+                "latency": "0.012s",
+            }]})
+        elif self.path == "/bytebase.v1.DatabaseService/GetDatabaseMetadata":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            assert msg["name"].endswith("/metadata"), msg
+            if msg["name"].startswith("instances/my1/"):
+                # MySQL has no named schemas, and the server matches
+                # `schema == "x"` exactly -- the client must have dropped it.
+                assert "schema ==" not in msg.get("filter", ""), msg
+            self._json(200, metadata_response(msg["name"], msg.get("filter", "")))
+        elif self.path == "/bytebase.v1.SheetService/CreateSheet":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            assert msg["parent"] == "projects/hr", msg
+            state["sheet_content"] = base64.b64decode(
+                msg["sheet"]["content"], validate=True
+            ).decode()
+            self._json(200, {"name": "projects/hr/sheets/1"})
+        elif self.path == "/bytebase.v1.PlanService/CreatePlan":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            assert msg["parent"] == "projects/hr", msg
+            spec = msg["plan"]["specs"][0]
+            assert spec["changeDatabaseConfig"]["targets"] == [
+                "instances/pg1/databases/employee"
+            ], spec
+            assert spec["changeDatabaseConfig"]["sheet"] == "projects/hr/sheets/1", spec
+            self._json(200, {"name": "projects/hr/plans/1"})
+        elif self.path == "/bytebase.v1.PlanService/RunPlanChecks":
+            if not self.require_auth():
+                return
+            self._json(200, {})
+        elif self.path == "/bytebase.v1.PlanService/GetPlanCheckRun":
+            if not self.require_auth():
+                return
+            assert json.loads(body)["name"] == "projects/hr/plans/1/planCheckRun", body
+            self._json(200, {"status": "DONE",
+                             "results": [{"status": "SUCCESS", "title": "ok"},
+                                         {"status": "WARNING", "title": "no index"}]})
+        elif self.path == "/bytebase.v1.IssueService/CreateIssue":
+            if not self.require_auth():
+                return
+            msg = json.loads(body)
+            assert msg["issue"]["plan"] == "projects/hr/plans/1", msg
+            assert msg["issue"]["type"] == "DATABASE_CHANGE", msg
+            self._json(200, {"name": "projects/hr/issues/1",
+                             "approvalStatus": state["approval"]})
+        elif self.path == "/bytebase.v1.RolloutService/CreateRollout":
+            if not self.require_auth():
+                return
+            # The parent of a rollout is the plan, not the project.
+            assert json.loads(body)["parent"] == "projects/hr/plans/1", body
+            self._json(200, {"name": "projects/hr/plans/1/rollout"})
         else:
             self._json(404, {"code": "not_found", "message": f"no such endpoint {self.path}"})
 
@@ -308,6 +504,134 @@ def main():
         assert ok.stdout.lstrip().startswith("{"), ok.stdout
         assert f"MockService/Echo -> {base}" in ok.stderr, ok.stderr
         print("   ok: echo, structured errors with recovery hint, target echo")
+
+        # --- 2a) friendly commands: query / schema / change propose ---
+        step("query (resolution, flattening, truncation)")
+        # The exact tier wins over the substring one, so "employee" is not
+        # ambiguous with "employee_archive"; READ_ONLY beats the ADMIN data
+        # source listed before it; and asking for limit+1 is what makes
+        # `truncated` a fact rather than a guess.
+        out = run_cli("query", "employee", "SELECT 1", "--limit", "2")
+        result = json.loads(out.stdout)
+        assert result["database"] == "instances/pg1/databases/employee", result
+        assert result["dataSourceId"] == "ro", result
+        assert result["columns"] == ["id", "name", "ts"], result
+        assert result["rows"] == [[1, "a", "2026-01-01T00:00:00Z"]] * 2, result
+        assert result["rowCount"] == 2 and result["truncated"] is True, result
+        assert result["latencyMs"] == 12, result
+        # Every underlying call is attributable, exactly like `api`.
+        assert f"DatabaseService/ListDatabases -> {base}" in out.stderr, out.stderr
+        assert f"SQLService/Query -> {base}" in out.stderr, out.stderr
+        assert 'resolved "employee" ->' in out.stderr, out.stderr
+
+        # Two databases match "emp": the CLI must list them, not choose. A
+        # wrong pick here would run SQL against a database nobody named.
+        out = run_cli("query", "emp", "SELECT 1", expect_fail=True)
+        assert out.returncode != 0, out.stdout
+        assert "[AMBIGUOUS_TARGET]" in out.stderr, out.stderr
+        assert "instances/pg1/databases/employee" in out.stderr, out.stderr
+        assert "instances/my1/databases/employee_archive" in out.stderr, out.stderr
+        assert out.stdout == "", "a refusal must not print JSON to stdout"
+
+        # ...and narrowing resolves the same ambiguous input.
+        out = run_cli("query", "emp", "SELECT 1", "--instance", "pg1")
+        assert json.loads(out.stdout)["database"] == "instances/pg1/databases/employee"
+
+        # A full resource name is taken at its word: one GetDatabase, no listing.
+        out = run_cli("query", "instances/pg1/databases/employee", "SELECT 1", "--limit", "1")
+        assert json.loads(out.stdout)["rowCount"] == 1, out.stdout
+        assert "DatabaseService/GetDatabase ->" in out.stderr, out.stderr
+        assert "ListDatabases" not in out.stderr, out.stderr
+
+        # The statement can come from stdin, like --args-file does for `api`.
+        out = run_cli("query", "employee", "--file", "-", "--limit", "1", stdin="SELECT 1\n")
+        assert json.loads(out.stdout)["rowCount"] == 1, out.stdout
+
+        # An error inside a 200 is a failure, not an empty result set.
+        out = run_cli("query", "employee", "SELECT bad", expect_fail=True)
+        assert out.returncode != 0, out.stdout
+        assert "[QUERY_ERROR]" in out.stderr and "syntax error" in out.stderr, out.stderr
+        assert out.stdout == "", out.stdout
+        print("   ok: tiered resolution, ambiguity refused, flattening, truncation")
+
+        step("schema (summary, drill-down, missing table)")
+        out = run_cli("schema", "employee")
+        result = json.loads(out.stdout)
+        assert result["engine"] == "POSTGRES", result
+        table = result["schemas"][0]["tables"][0]
+        assert table["name"] == "orders", result
+        assert table["rowCount"] == 42, "an int64 string must come back a number"
+        assert table["columnCount"] == 2, table
+        assert "columns" not in table, "summary must stay compact"
+        assert result["schemas"][0]["views"] == ["v_orders"], result
+
+        out = run_cli("schema", "employee", "--table", "orders")
+        result = json.loads(out.stdout)
+        assert "schemas" not in result, result
+        assert result["table"]["columns"][0]["primaryKey"] is True, result
+        assert result["table"]["foreignKeys"][0]["referencedTable"] == "users", result
+        assert result["table"]["columns"][1]["default"] == "0", "--table implies details"
+
+        out = run_cli("schema", "employee", "--table", "nope", expect_fail=True)
+        assert out.returncode != 0, out.stdout
+        assert "[TABLE_NOT_FOUND]" in out.stderr, out.stderr
+        assert "run without --table" in out.stderr, out.stderr
+        assert out.stdout == "", out.stdout
+
+        # MySQL has no named schemas, so --schema is dropped (the mock asserts
+        # it never reaches the wire) and the tables still come back. Keeping
+        # the filter would return zero tables and read as an empty database.
+        out = run_cli("schema", "employee_archive", "--schema", "public", "--include", "columns")
+        assert "--schema ignored" in out.stderr and "MYSQL" in out.stderr, out.stderr
+        result = json.loads(out.stdout)
+        assert result["engine"] == "MYSQL", result
+        assert result["schemas"][0]["tables"][0]["columns"][0]["name"] == "id", result
+        assert "columnCount" not in result["schemas"][0]["tables"][0], result
+        print("   ok: summary vs details, primary keys, TABLE_NOT_FOUND, schema drop")
+
+        step("change propose (chain, rollout gates)")
+        sql = "ALTER TABLE t ADD c int"
+        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
+        result = json.loads(out.stdout)
+        assert result["sheet"] == "projects/hr/sheets/1", result
+        assert result["plan"] == "projects/hr/plans/1", result
+        assert result["issue"] == "projects/hr/issues/1", result
+        assert server.state["sheet_content"] == sql, server.state["sheet_content"]
+        # Successful checks are dropped; the warning is what an agent acts on.
+        assert result["planChecks"]["summary"] == {"error": 0, "warning": 1}, result
+        assert result["planChecks"]["results"] == [
+            {"type": "WARNING", "message": "no index"}
+        ], result
+        # No --rollout: say so, and stop at the human rather than approving.
+        assert result["rolloutDeferredReason"] == "NOT_REQUESTED", result
+        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
+        assert result["rolloutCreated"] is False, result
+        assert result["links"]["issue"] == f"{base}/projects/hr/issues/1", result
+        assert "rollout" not in result["links"], result
+
+        # Asked for, but the approval is still pending: deferred with the
+        # reason, not attempted.
+        result = json.loads(run_cli(
+            "change", "propose", "employee", "--sql", sql, "--title", "add c", "--rollout",
+        ).stdout)
+        assert result["rolloutDeferredReason"] == "APPROVAL_PENDING", result
+        assert result["rolloutCreated"] is False, result
+        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
+
+        # Approved, checks clean: now the rollout is created and the agent is
+        # sent to watch it.
+        server.state["approval"] = "APPROVED"
+        result = json.loads(run_cli(
+            "change", "propose", "employee", "--sql", sql, "--title", "add c",
+            "--rollout", "--reason", "TICKET-1",
+        ).stdout)
+        assert result["rolloutCreated"] is True, result
+        assert result["rollout"] == "projects/hr/plans/1/rollout", result
+        assert result["nextAction"] == "MONITOR_ROLLOUT", result
+        assert "rolloutDeferredReason" not in result, result
+        assert result["links"]["rollout"] == f"{base}/projects/hr/plans/1/rollout", result
+        server.state["approval"] = "PENDING"
+        print("   ok: sheet/plan/checks/issue chain, rollout gates, links")
 
         # --- 2b) config family ---
         step("config (view / use / check / path)")

@@ -111,15 +111,20 @@ Five steps from an empty machine to a first query:
    is what keeps the installed copy from describing an older bbcli. Re-running
    with nothing to change is a no-op; `--force` overwrites a copy you edited.
 
-5. **Run the first query** — find a database, then read from it:
+5. **Run the first query** — name the database, not its resource path:
+
+   ```bash
+   bbcli schema employee                        # what is in there
+   bbcli query employee 'SELECT count(*) FROM orders'
+   ```
+
+   `query` and `schema` resolve `employee` to
+   `instances/<instance>/databases/<database>` themselves. Anything they do
+   not cover goes through `bbcli api`:
 
    ```bash
    bbcli skill query                            # the full flow, offline
    bbcli api DatabaseService/ListDatabases --args '{"parent": "workspaces/-"}'
-   bbcli api SQLService/Query --args '{
-     "name": "instances/<instance>/databases/<database>",
-     "statement": "SELECT 1"
-   }'
    ```
 
 ## Usage
@@ -129,6 +134,13 @@ bbcli search                                   # all services (offline)
 bbcli search --service SQLService              # methods of one service
 bbcli search --operation-id SQLService/Query   # request fields of a method
 bbcli search --schema QueryRequest             # one message type
+
+bbcli query employee 'SELECT * FROM orders LIMIT 5'   # resolves the database by name
+bbcli query employee 'SELECT 1' --instance prod-pg --limit 20
+bbcli schema employee                          # compact overview
+bbcli schema employee --table orders           # one table in full detail
+bbcli change propose employee \
+  --sql 'ALTER TABLE orders ADD COLUMN note text' --title 'Add note'
 
 bbcli api SQLService/Query --args '{
   "name": "instances/e1/databases/db",
@@ -145,6 +157,9 @@ bbcli skill query                              # bundled task guide
 
 | Command | Description |
 |---|---|
+| `query <database> <statement> [--file F] [--instance I] [--project P] [--limit N]` | Run one read-only statement: resolves the database by name, picks the READ_ONLY data source, and flattens the rows into plain JSON with an exact `truncated` flag |
+| `schema <database> [--instance I] [--project P] [--schema S] [--table T] [--include summary\|columns\|details]` | Schema of a database: a compact per-table overview, or one table with its columns, indexes and foreign keys (`--table` implies `--include details`) |
+| `change propose <database> (--sql TEXT \| --file F) --title T [--rollout] [--reason R]` | The review flow in one command: sheet → plan → plan checks → issue, and a rollout only with `--rollout` and only when checks and approval allow it. Reports `nextAction` and, when no rollout was created, why |
 | `api <Service/Method> [--args JSON \| --args-file F]` | Direct Connect call, prints the JSON response; non-2xx exits 1 with the server's message |
 | `search [--service S \| --operation-id O \| --schema T]` | Offline API catalog (embedded OpenAPI spec) |
 | `skill [name]` | Offline task guides (query, database-change, grant-permission) |
@@ -221,9 +236,9 @@ URLs/ports instead.
 
 | Flag | Applies to | Description |
 |---|---|---|
-| `--context <name-or-url>` | api/login/logout | Context name or server base URL; env `BBCLI_SERVER` (a URL, for CI); otherwise the `.bbcli` file or the active context |
+| `--context <name-or-url>` | every command that reaches the server | Context name or server base URL; env `BBCLI_SERVER` (a URL, for CI); otherwise the `.bbcli` file or the active context |
 | `--insecure` | all network | Accept invalid TLS certificates (self-signed deployments) |
-| `--timeout <seconds>` | api/config check | Fail the call after N seconds; env `BBCLI_TIMEOUT`. Unset by default — a client timeout does **not** cancel server-side work, so check the resource's status before retrying |
+| `--timeout <seconds>` | every command that reaches the server | Fail the call after N seconds; env `BBCLI_TIMEOUT`. Unset by default — a client timeout does **not** cancel server-side work, so check the resource's status before retrying |
 | `--no-browser` | login | Print the authorization URL instead of opening a browser. Pasting the redirect works either way — see [Logging in when the browser is elsewhere](#logging-in-when-the-browser-is-elsewhere) |
 
 ## Storage
@@ -267,6 +282,22 @@ The code is what decides the next step — `unauthenticated` means re-login,
 intent from prose. stdout stays pure JSON; diagnostics and the resolved target
 server go to stderr.
 
+`query`, `schema` and `change propose` can also refuse before reaching the
+server, and those codes are UPPER_SNAKE so you can tell the two apart at a
+glance — lowercase came from Bytebase, uppercase from bbcli:
+
+```
+[AMBIGUOUS_TARGET] 2 databases match "emp"; narrow with --instance/--project or pass the full resource name:
+  instances/my1/databases/employee_archive  (MYSQL, projects/hr)
+  instances/pg1/databases/employee  (POSTGRES, projects/hr)
+```
+
+`AMBIGUOUS_TARGET`, `DATABASE_NOT_FOUND`, `TABLE_NOT_FOUND`,
+`AMBIGUOUS_TABLE` and `QUERY_ERROR` each name what to change. The
+`*_CREATE_FAILED` codes from `change propose` also list what already exists
+(`created so far: sheet=..., plan=...`) — nothing is rolled back, so those
+resources are yours to reuse or clean up.
+
 ## Limitations
 
 - **Login needs a browser somewhere, and a person at it.** The browser does
@@ -291,9 +322,10 @@ cargo build && python3 scripts/e2e_test.py   # end-to-end against a mock Connect
 
 The E2E script spins up an in-process mock of the OAuth2 endpoints and a
 Connect endpoint, and verifies the full lifecycle: login (registration + PKCE
-+ code exchange), `api` calls (args/args-file/error propagation),
-401-triggered refresh and replay, cross-process refresh-token adoption, and
-logout/revocation.
++ code exchange), `api` calls (args/args-file/error propagation), the friendly
+commands (`query` resolution and truncation, `schema` summary vs drill-down,
+the `change propose` chain and its rollout gates), 401-triggered refresh and
+replay, cross-process refresh-token adoption, and logout/revocation.
 
 CI (`.github/workflows/ci.yml`) runs clippy and the unit tests on Linux, macOS
 and Windows, `cargo fmt --check` once, and the E2E script on the two Unix
