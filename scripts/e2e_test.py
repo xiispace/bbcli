@@ -50,7 +50,10 @@ def make_mock():
         # Approval the mock hands back from CreateIssue, and the sheet content
         # it last received -- the rollout gates and the base64 encoding are
         # asserted against these.
-        "approval": "PENDING", "sheet_content": None,
+        # `approval` is what the issue settles to and what GetIssue reports;
+        # `approval_at_create` is what CreateIssue answers first, which on a
+        # real server is usually CHECKING and not yet the verdict.
+        "approval": "PENDING", "approval_at_create": None, "sheet_content": None,
     }
     return httpd
 
@@ -340,6 +343,12 @@ class Handler(BaseHTTPRequestHandler):
             msg = json.loads(body)
             assert msg["issue"]["plan"] == "projects/hr/plans/1", msg
             assert msg["issue"]["type"] == "DATABASE_CHANGE", msg
+            self._json(200, {"name": "projects/hr/issues/1",
+                             "approvalStatus": state["approval_at_create"] or state["approval"]})
+        elif self.path == "/bytebase.v1.IssueService/GetIssue":
+            if not self.require_auth():
+                return
+            assert json.loads(body)["name"] == "projects/hr/issues/1", body
             self._json(200, {"name": "projects/hr/issues/1",
                              "approvalStatus": state["approval"]})
         elif self.path == "/bytebase.v1.RolloutService/CreateRollout":
@@ -650,7 +659,29 @@ def main():
         assert "rolloutDeferredReason" not in result, result
         assert result["links"]["rollout"] == f"{base}/projects/hr/plans/1/rollout", result
         server.state["approval"] = "PENDING"
-        print("   ok: sheet/plan/checks/issue chain, rollout gates, links")
+
+        # CreateIssue answers CHECKING before the approval template is found,
+        # which is what a real server does. Reporting that verbatim stops for
+        # a human on a change that needed no approval, so bbcli waits for the
+        # verdict and reports it -- here SKIPPED, which lifts the rollout gate.
+        server.state["approval_at_create"] = "CHECKING"
+        server.state["approval"] = "SKIPPED"
+        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
+        result = json.loads(out.stdout)
+        assert result["approvalStatus"] == "SKIPPED", result
+        assert result["nextAction"] == "CREATE_ROLLOUT", result
+        assert f"IssueService/GetIssue -> {base}" in out.stderr, out.stderr
+
+        # A settled PENDING is a real request for a human, so it must not cost
+        # the settle wait at all -- no GetIssue is issued.
+        server.state["approval_at_create"] = None
+        server.state["approval"] = "PENDING"
+        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
+        result = json.loads(out.stdout)
+        assert result["approvalStatus"] == "PENDING", result
+        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
+        assert "IssueService/GetIssue" not in out.stderr, out.stderr
+        print("   ok: sheet/plan/checks/issue chain, rollout gates, links, approval settling")
 
         # --- 2b) config family ---
         step("config (view / use / check / path)")

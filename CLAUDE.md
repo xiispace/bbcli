@@ -178,7 +178,17 @@ These are settled trade-offs, not gaps waiting to be filled.
   agent or a human decides. `nextAction` is one of `AWAIT_HUMAN_APPROVAL`,
   `CREATE_ROLLOUT`, `MONITOR_ROLLOUT`, `WAIT_PLAN_CHECK`, `FIX_SQL_AND_RETRY`
   and never names `ApproveIssue`: the agent does not approve on the user's
-  behalf. There is no change-type flag: the server detects MIGRATE vs SDL
+  behalf. It is derived from the *settled* approval, not from the one
+  `CreateIssue` answers with — that one is usually `CHECKING`, because the
+  approval template is still being found, and a project with no policy
+  settles to `SKIPPED` milliseconds later. So a `CHECKING` or unset status
+  costs one bounded re-read (3 s, far shorter than the plan-check budget,
+  because a stuck `CHECKING` wants `RetryIssueApproval` rather than a longer
+  wait); `PENDING` is already a verdict and costs nothing. Still unsettled
+  when the budget runs out reports as needing a human, which is the safe
+  direction. The raw `approvalStatus` is in the output next to `nextAction`,
+  because a real `PENDING` and a `CHECKING` that never settled need
+  different things from a person. There is no change-type flag: the server detects MIGRATE vs SDL
   from the sheet content, and upstream's `changeType` parameter is echoed
   but unused.
 

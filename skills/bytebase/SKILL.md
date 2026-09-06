@@ -66,8 +66,8 @@ Read `nextAction` in the output and stop there:
 
 | `nextAction` | What to do |
 |---|---|
-| `AWAIT_HUMAN_APPROVAL` | Stop. Give the user `links.issue` and let them approve. |
-| `CREATE_ROLLOUT` | Approved already: re-run with `--rollout`. |
+| `AWAIT_HUMAN_APPROVAL` | Stop. Give the user `links.issue` and let them approve. Read `approvalStatus` too: `PENDING` means a human was really asked, `CHECKING` means the server never finished deciding and the issue may need `IssueService/RetryIssueApproval`. |
+| `CREATE_ROLLOUT` | Approved already, or the project has no approval policy (`approvalStatus: SKIPPED`): re-run with `--rollout`. |
 | `MONITOR_ROLLOUT` | The rollout exists; watch it with `bbcli api RolloutService/GetRollout`. |
 | `WAIT_PLAN_CHECK` | Checks were still running; re-run in a moment. |
 | `FIX_SQL_AND_RETRY` | A plan check failed or the issue was rejected — read `planChecks.results`. |

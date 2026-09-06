@@ -52,6 +52,13 @@ const CHECK_FAILED: &str = "FAILED";
 const POLL_BUDGET: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long to let the server settle `CHECKING` into a real verdict. Much
+/// shorter than the plan-check budget: finding an approval template is a
+/// local decision that takes milliseconds, and one that hangs needs
+/// `RetryIssueApproval`, not a longer wait.
+const APPROVAL_SETTLE_BUDGET: Duration = Duration::from_secs(3);
+const APPROVAL_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct PlanCheckInfo {
@@ -181,12 +188,13 @@ pub async fn propose(
                 hint,
             )
         })?;
-    let approval = issue
+    let created_approval = issue
         .get("approvalStatus")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     let issue = resource_name(&issue).context("CreateIssue returned no resource name")?;
+    let approval = settle_approval(client, &issue, created_approval).await;
 
     let mut next_action = derive_next_action(&approval);
     let mut rollout_created = false;
@@ -236,6 +244,11 @@ pub async fn propose(
         "plan": plan,
         "planChecks": checks,
         "issue": issue,
+        // The server's own verdict, alongside the action derived from it. An
+        // agent that only sees AWAIT_HUMAN_APPROVAL cannot tell a real
+        // PENDING from a CHECKING that never settled, and those need
+        // different things from a person.
+        "approvalStatus": approval,
         "rolloutCreated": rollout_created,
         "nextAction": next_action,
     });
@@ -352,6 +365,66 @@ fn build_plan_check_info(run: &Value, check_run: &str) -> PlanCheckInfo {
     }
 }
 
+/// Whether `status` is the server's verdict rather than a step on the way to
+/// one. `CHECKING` and an unset status are not: the approval template is
+/// still being found. `PENDING` is — it means a human really was asked.
+///
+/// Anything unrecognised counts as settled. A status this binary has not
+/// heard of already stops for a human (see `derive_next_action`), so waiting
+/// on it would buy nothing but the wait.
+fn approval_settled(status: &str) -> bool {
+    !matches!(status, "" | "APPROVAL_STATUS_UNSPECIFIED" | "CHECKING")
+}
+
+/// Waits briefly for the server to finish deciding whether this change needs
+/// a human at all.
+///
+/// `CreateIssue` answers before the approval template has been found, so its
+/// `approvalStatus` is usually `CHECKING`. Reporting that as
+/// `AWAIT_HUMAN_APPROVAL` sends someone to look at an issue that needed no
+/// approval: a project with no policy settles to `SKIPPED` in milliseconds,
+/// and the agent stops for nothing.
+///
+/// The budget is short because `CHECKING` can genuinely get stuck, which is
+/// what `IssueService/RetryIssueApproval` exists for. Still unsettled when it
+/// runs out is reported as needing a human, which is the safe direction to
+/// be wrong in.
+async fn settle_approval(client: &ApiClient, issue: &str, created: String) -> String {
+    if approval_settled(&created) {
+        return created;
+    }
+    client.announce("IssueService/GetIssue");
+    eprintln!(
+        "  approval is {}, waiting up to {}s for the server to settle it",
+        if created.is_empty() {
+            "unset"
+        } else {
+            &created
+        },
+        APPROVAL_SETTLE_BUDGET.as_secs()
+    );
+
+    let deadline = tokio::time::Instant::now() + APPROVAL_SETTLE_BUDGET;
+    loop {
+        // Read before sleeping: the server usually settles in milliseconds,
+        // and a leading sleep would spend the whole interval finding that out.
+        if let Ok(resp) = client
+            .call("IssueService/GetIssue", &json!({"name": issue}))
+            .await
+        {
+            if let Some(status) = resp.get("approvalStatus").and_then(Value::as_str) {
+                if approval_settled(status) {
+                    return status.to_string();
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return created;
+        }
+        tokio::time::sleep(APPROVAL_SETTLE_INTERVAL).await;
+    }
+}
+
 /// What to do after the issue exists, from the approval the server assigned.
 fn derive_next_action(approval: &str) -> &'static str {
     match approval {
@@ -443,6 +516,46 @@ mod tests {
             results: Vec::new(),
             plan_check_run: Some("p/planCheckRun".to_string()),
         }
+    }
+
+    /// `CHECKING` is the server still deciding, not a decision. Treating it
+    /// as one reports AWAIT_HUMAN_APPROVAL for a change that needed no
+    /// approval at all, which is a person interrupted for nothing. `PENDING`
+    /// is the opposite: a real request for a human, and waiting on it would
+    /// burn the budget every time.
+    #[test]
+    fn checking_is_not_a_verdict_but_pending_is() {
+        assert!(!approval_settled("CHECKING"));
+        assert!(!approval_settled(""));
+        assert!(!approval_settled("APPROVAL_STATUS_UNSPECIFIED"));
+
+        assert!(approval_settled("PENDING"));
+        assert!(approval_settled("APPROVED"));
+        assert!(approval_settled("REJECTED"));
+        assert!(approval_settled("SKIPPED"));
+        // An unrecognised status already stops for a human, so waiting on it
+        // would buy the wait and nothing else.
+        assert!(approval_settled("SOMETHING_NEW"));
+    }
+
+    /// The settle wait exists to turn this pairing around: `CHECKING` at
+    /// creation stops for a human, and the same issue moments later does not.
+    #[test]
+    fn a_status_that_settles_late_changes_the_next_action() {
+        assert_eq!(derive_next_action("CHECKING"), AWAIT_HUMAN_APPROVAL);
+        assert_eq!(derive_next_action("SKIPPED"), CREATE_ROLLOUT);
+        // ...and with --rollout, the same settling is what lifts the gate.
+        assert_eq!(
+            rollout_decision(true, &done(0, 0), "CHECKING"),
+            Rollout::Deferred {
+                reason: APPROVAL_PENDING,
+                next: Some(AWAIT_HUMAN_APPROVAL)
+            }
+        );
+        assert_eq!(
+            rollout_decision(true, &done(0, 0), "SKIPPED"),
+            Rollout::Attempt
+        );
     }
 
     /// The agent must never approve on the user's behalf, so every status that
