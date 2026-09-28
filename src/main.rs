@@ -39,7 +39,9 @@ Note: this guide uses MCP tool syntax. Equivalent bbcli commands:
                                                [--include summary|columns|details]
   propose_database_change(database=, sql=, title=, ...)
                                             -> bbcli change propose <database> --sql '...' \\
-                                               --title '...' [--rollout] [--reason '...']
+                                               --title '...' [--reason '...']
+                                               (stops at the plan: no issue, no rollout;
+                                               create those with `bbcli api`)
 ---- guide follows ----";
 
 /// Task guides embedded from `backend/api/mcp/skills/` (same content the MCP
@@ -208,9 +210,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ChangeAction {
-    /// Create sheet -> plan -> plan checks -> issue for one database, and a
-    /// rollout only with --rollout (mirrors the MCP propose_database_change
-    /// tool). Nothing is approved on your behalf
+    /// Create sheet -> plan -> plan checks for one database and stop at the
+    /// plan (the first half of the MCP propose_database_change tool). No issue
+    /// or rollout is created
     #[command(group(clap::ArgGroup::new("sql_source").required(true).args(["sql", "file"])))]
     Propose {
         /// Database: a name, a substring of one, or the full
@@ -222,7 +224,7 @@ enum ChangeAction {
         /// Read the SQL from a file, or "-" for stdin
         #[arg(long, conflicts_with = "sql")]
         file: Option<String>,
-        /// Title for the plan and the issue; what reviewers see first
+        /// Title for the plan; what reviewers see first
         #[arg(long)]
         title: String,
         /// Narrow resolution to one instance: an id or instances/{id}
@@ -231,11 +233,7 @@ enum ChangeAction {
         /// Narrow resolution to one project: an id or projects/{id}
         #[arg(long)]
         project: Option<String>,
-        /// Also create the rollout, if plan checks and approval allow it;
-        /// the output's rolloutDeferredReason says why not when they do not
-        #[arg(long)]
-        rollout: bool,
-        /// Context or ticket reference; becomes the issue description
+        /// Context or ticket reference; becomes the plan description
         #[arg(long)]
         reason: Option<String>,
     },
@@ -353,7 +351,6 @@ async fn main() -> Result<()> {
                 title,
                 instance,
                 project,
-                rollout,
                 reason,
             } => {
                 let client = api_client(&cli, context_from_env)?;
@@ -369,7 +366,6 @@ async fn main() -> Result<()> {
                     &title,
                     instance.as_deref(),
                     project.as_deref(),
-                    rollout,
                     reason.as_deref(),
                 )
                 .await?;

@@ -53,8 +53,8 @@ truncated, latencyMs}`. `truncated: true` means there were more rows than
 `--limit`; raise it or add a `WHERE`. Read `bbcli skill query` for the full
 flow, including how masked values must be presented.
 
-Propose a schema change — this creates a sheet, a plan, plan checks and an
-issue in one command:
+Propose a schema change — this creates a sheet and a plan, runs the plan
+checks, and stops at the plan. It does **not** create an issue or a rollout:
 
 ```bash
 bbcli change propose employee \
@@ -62,21 +62,30 @@ bbcli change propose employee \
   --title 'Add orders.note' --reason 'TICKET-1234'
 ```
 
-Read `nextAction` in the output and stop there:
+Read `nextAction` in the output:
 
 | `nextAction` | What to do |
 |---|---|
-| `AWAIT_HUMAN_APPROVAL` | Stop. Give the user `links.issue` and let them approve. Read `approvalStatus` too: `PENDING` means a human was really asked, `CHECKING` means the server never finished deciding and the issue may need `IssueService/RetryIssueApproval`. |
-| `CREATE_ROLLOUT` | Approved already, or the project has no approval policy (`approvalStatus: SKIPPED`): re-run with `--rollout`. |
-| `MONITOR_ROLLOUT` | The rollout exists; watch it with `bbcli api RolloutService/GetRollout`. |
-| `WAIT_PLAN_CHECK` | Checks were still running; re-run in a moment. |
-| `FIX_SQL_AND_RETRY` | A plan check failed or the issue was rejected — read `planChecks.results`. |
+| `CREATE_ISSUE` | Checks passed (warnings allowed). Give the user `links.plan`. Open an issue only if the user wants this change reviewed now — see below. |
+| `WAIT_PLAN_CHECK` | Checks were still running. Read `planChecks.planCheckRun` with `bbcli api PlanService/GetPlanCheckRun` in a moment; do not re-run `propose`, which would create a second plan. |
+| `FIX_SQL_AND_RETRY` | A plan check failed — read `planChecks.results`, fix the SQL, and propose again. |
 
-`rolloutCreated: false` means *bbcli* did not create one. It is not a
-promise that nothing is queued: some servers create the rollout together with
-the plan, so a rollout with a `NOT_STARTED` task can exist even without
-`--rollout`. Nothing runs until someone starts that task, but if the user
-asked you to leave no trace, check it and say what you found:
+To send the plan into review, open an issue on it with `api`:
+
+```bash
+bbcli api IssueService/CreateIssue --args '{
+  "parent": "<project>",
+  "issue": {"title": "Add orders.note", "type": "DATABASE_CHANGE", "plan": "<plan>"}
+}'
+```
+
+The vendored `database-change` guide says `propose_database_change` also
+creates the issue. bbcli's `change propose` does not; follow this section.
+
+Even without an issue, a rollout may already exist: some servers create the
+rollout together with the plan, so a rollout with a `NOT_STARTED` task can
+be there. Nothing runs until someone starts that task, but if the user asked
+you to leave no trace, check it and say what you found:
 
 ```bash
 bbcli api RolloutService/GetRollout --args '{"name": "<plan>/rollout"}'
@@ -101,10 +110,10 @@ bbcli api InstanceService/GetInstance --args '{"name": "instances/e1"}'
 
 - **One statement per `query` call.** Extra result sets are dropped with a
   note on stderr; send separate calls instead.
-- **Never approve an issue on the user's behalf.** `AWAIT_HUMAN_APPROVAL`
-  means stop and hand `links.issue` to the user — do not call `ApproveIssue`.
+- **Never approve an issue or start a rollout on the user's behalf.** Hand
+  the link to the user — do not call `ApproveIssue` or `CreateRollout`.
 - **`created so far:` in an error is a list of real resources.** `change
-  propose` rolls nothing back, so those sheets and plans still exist: reuse
+  propose` rolls nothing back, so those sheets still exist: reuse
   them or tell the user to clean them up, but do not assume a retry starts
   from nothing.
 - **Never guess a resource name.** If a command cannot resolve one, list the
@@ -184,7 +193,7 @@ lowercase is Bytebase, uppercase is bbcli:
 | `TABLE_NOT_FOUND` | Re-run `bbcli schema <database>` without `--table` to see what exists; the error also lists near-miss candidates. |
 | `AMBIGUOUS_TABLE` | That table name exists in several schemas — add `--schema <one of the listed>`. |
 | `QUERY_ERROR` | The server ran the statement and it failed. Fix the SQL; do not retry unchanged. |
-| `SHEET_CREATE_FAILED`, `PLAN_CREATE_FAILED`, `ISSUE_CREATE_FAILED` | Read the Connect code quoted inside the message — that is the real cause. Anything under `created so far:` already exists; do not recreate it. |
+| `SHEET_CREATE_FAILED`, `PLAN_CREATE_FAILED` | Read the Connect code quoted inside the message — that is the real cause. Anything under `created so far:` already exists; do not recreate it. |
 
 - `invalid_grant` on refresh: the 30-day refresh token expired or was revoked —
   the user must re-run `bbcli login`. `bbcli status` distinguishes an expired
