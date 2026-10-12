@@ -7,6 +7,11 @@ name: Release
 #
 # Make sure CI is green on main first — this workflow builds and publishes, it
 # does not re-run the test suite.
+#
+# Publishing also regenerates Formula/bbcli.rb in xiispace/homebrew-tap, so
+# `brew install xiispace/tap/bbcli` follows every release. TAP_DEPLOY_KEY (a
+# write deploy key on that repo) lives in this repo's `homebrew-tap`
+# environment; without it the tap step is skipped with a notice.
 
 on:
   push:
@@ -131,6 +136,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    environment: homebrew-tap
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -151,3 +157,87 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+
+      # The formula installs the same archives the release just published, so
+      # brew users get the identical bytes SHA256SUMS describes — no source
+      # build, no Rust toolchain on the user's machine.
+      - name: Update Homebrew formula
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_DEPLOY_KEY}" ]; then
+            echo "::notice::TAP_DEPLOY_KEY not set — skipping tap update."
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          sha() { cut -d' ' -f1 "dist/${BIN}-$1.tar.gz.sha256"; }
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          cat > "${BIN}.rb" <<EOF
+          class Bbcli < Formula
+            desc "CLI for a Bytebase server, built to be driven by coding agents"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${base}/${BIN}-aarch64-apple-darwin.tar.gz"
+                sha256 "$(sha aarch64-apple-darwin)"
+              end
+              on_intel do
+                url "${base}/${BIN}-x86_64-apple-darwin.tar.gz"
+                sha256 "$(sha x86_64-apple-darwin)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/${BIN}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha aarch64-unknown-linux-gnu)"
+              end
+              on_intel do
+                url "${base}/${BIN}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha x86_64-unknown-linux-gnu)"
+              end
+            end
+
+            def install
+              bin.install "${BIN}"
+              # The binary embeds vendor/bytebase/ (MIT Expat); keep its notice
+              # alongside, as the release archives do.
+              pkgshare.install "vendor"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/${BIN} --version")
+              assert_match "Bytebase", shell_output("#{bin}/${BIN} --help")
+            end
+          end
+          EOF
+          echo "----- generated Formula/${BIN}.rb -----"; cat "${BIN}.rb"
+          ruby -c "${BIN}.rb"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${TAP_DEPLOY_KEY}" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+          git clone "git@github.com:${GITHUB_REPOSITORY_OWNER}/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp "${BIN}.rb" "tap/Formula/${BIN}.rb"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Formula/${BIN}.rb"
+          if git diff --cached --quiet; then echo "Formula already up to date."; exit 0; fi
+          git commit -m "${BIN} ${VERSION}"
+          # Other repos release into the same tap; rebase over their pushes.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD; then exit 0; fi
+            sleep "$(( (RANDOM % 6) + 1 ))"
+            git pull --rebase origin HEAD
+          done
+          echo "::error::failed to push tap update" >&2
+          exit 1

@@ -283,6 +283,13 @@ The workflow's first job refuses to build unless the tag equals
 silent: binaries reporting a version that exists nowhere on GitHub, which is
 precisely what a version is for.
 
+**Homebrew follows the release.** After publishing, `release.yml` regenerates
+`Formula/bbcli.rb` in `xiispace/homebrew-tap` from the archives it just
+uploaded, pushing with `TAP_DEPLOY_KEY` (a write deploy key on the tap, stored
+in this repo's `homebrew-tap` environment). The formula is generated, not
+edited in the tap — change it in `release.yml`. Without the secret the step
+is skipped with a notice rather than failing the release.
+
 **Release archives carry the vendored notice.** The binary embeds
 `vendor/bytebase/` (MIT Expat) via `include_str!`, so every archive ships
 `vendor/bytebase/LICENSE` and `SOURCE.md` alongside the binary. Keep that step

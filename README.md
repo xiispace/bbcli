@@ -44,7 +44,15 @@ bbcli sidesteps this:
 
 ## Install
 
-Requires a Rust toolchain (1.75+); no other dependencies, and no network
+On macOS or Linux with [Homebrew](https://brew.sh):
+
+```bash
+brew install xiispace/tap/bbcli
+```
+
+The formula installs the prebuilt release archive described below and is
+updated by every tagged release. To build from source instead — this
+requires a Rust toolchain (1.75+); no other dependencies, and no network
 access to a Bytebase repo — the catalog is vendored.
 
 ```bash
