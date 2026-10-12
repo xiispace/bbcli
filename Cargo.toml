@@ -1,6 +1,6 @@
 [package]
 name = "bbcli"
-version = "2026.9.6"
+version = "2026.10.12"
 edition = "2021"
 description = "CLI for a Bytebase server (Connect protocol) with OAuth2 auto-refresh, for CLI agents like Claude Code"
 license = "Apache-2.0"
