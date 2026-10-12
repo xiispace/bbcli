@@ -10,7 +10,7 @@ handlers. Covers, in order:
   2a. friendly commands: query / schema / change propose -- database
       resolution (tiered, ambiguous, full resource name), row flattening and
       truncation, schema summary vs table drill-down, and the
-      sheet->plan->checks->issue->rollout chain with its rollout gates
+      sheet->plan->checks chain stopping at the plan
   2b. config: view / use / check / path
   2c. contexts: named logins (--as), alias resolution everywhere, project
       .bbcli files, and precedence between them
@@ -47,13 +47,9 @@ def make_mock():
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     httpd.state = {
         "access": None, "refresh": None, "n": 0, "refresh_calls": 0,
-        # Approval the mock hands back from CreateIssue, and the sheet content
-        # it last received -- the rollout gates and the base64 encoding are
-        # asserted against these.
-        # `approval` is what the issue settles to and what GetIssue reports;
-        # `approval_at_create` is what CreateIssue answers first, which on a
-        # real server is usually CHECKING and not yet the verdict.
-        "approval": "PENDING", "approval_at_create": None, "sheet_content": None,
+        # The sheet content and plan description it last received -- the
+        # base64 encoding and --reason are asserted against these.
+        "sheet_content": None, "plan_description": None,
     }
     return httpd
 
@@ -325,6 +321,7 @@ class Handler(BaseHTTPRequestHandler):
                 "instances/pg1/databases/employee"
             ], spec
             assert spec["changeDatabaseConfig"]["sheet"] == "projects/hr/sheets/1", spec
+            state["plan_description"] = msg["plan"].get("description")
             self._json(200, {"name": "projects/hr/plans/1"})
         elif self.path == "/bytebase.v1.PlanService/RunPlanChecks":
             if not self.require_auth():
@@ -337,26 +334,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "DONE",
                              "results": [{"status": "SUCCESS", "title": "ok"},
                                          {"status": "WARNING", "title": "no index"}]})
-        elif self.path == "/bytebase.v1.IssueService/CreateIssue":
-            if not self.require_auth():
-                return
-            msg = json.loads(body)
-            assert msg["issue"]["plan"] == "projects/hr/plans/1", msg
-            assert msg["issue"]["type"] == "DATABASE_CHANGE", msg
-            self._json(200, {"name": "projects/hr/issues/1",
-                             "approvalStatus": state["approval_at_create"] or state["approval"]})
-        elif self.path == "/bytebase.v1.IssueService/GetIssue":
-            if not self.require_auth():
-                return
-            assert json.loads(body)["name"] == "projects/hr/issues/1", body
-            self._json(200, {"name": "projects/hr/issues/1",
-                             "approvalStatus": state["approval"]})
-        elif self.path == "/bytebase.v1.RolloutService/CreateRollout":
-            if not self.require_auth():
-                return
-            # The parent of a rollout is the plan, not the project.
-            assert json.loads(body)["parent"] == "projects/hr/plans/1", body
-            self._json(200, {"name": "projects/hr/plans/1/rollout"})
         else:
             self._json(404, {"code": "not_found", "message": f"no such endpoint {self.path}"})
 
@@ -617,71 +594,41 @@ def main():
         assert "columnCount" not in result["schemas"][0]["tables"][0], result
         print("   ok: summary vs details, primary keys, TABLE_NOT_FOUND, schema drop")
 
-        step("change propose (chain, rollout gates)")
+        step("change propose (chain, stops at the plan)")
         sql = "ALTER TABLE t ADD c int"
-        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
+        out = run_cli(
+            "change", "propose", "employee", "--sql", sql, "--title", "add c",
+            "--reason", "TICKET-1",
+        )
         result = json.loads(out.stdout)
         assert result["sheet"] == "projects/hr/sheets/1", result
         assert result["plan"] == "projects/hr/plans/1", result
-        assert result["issue"] == "projects/hr/issues/1", result
         assert server.state["sheet_content"] == sql, server.state["sheet_content"]
+        # With no issue to carry it, --reason lands on the plan.
+        assert server.state["plan_description"] == "TICKET-1", server.state
         # Successful checks are dropped; the warning is what an agent acts on.
         assert result["planChecks"]["summary"] == {"error": 0, "warning": 1}, result
         assert result["planChecks"]["results"] == [
             {"type": "WARNING", "message": "no index"}
         ], result
-        # No --rollout: say so, and stop at the human rather than approving.
-        assert result["rolloutDeferredReason"] == "NOT_REQUESTED", result
-        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
-        assert result["rolloutCreated"] is False, result
-        assert result["links"]["issue"] == f"{base}/projects/hr/issues/1", result
-        assert "rollout" not in result["links"], result
+        # Warnings do not block: the plan is fit to go on to an issue, which
+        # is the agent's (or a human's) next call, not this command's.
+        assert result["nextAction"] == "CREATE_ISSUE", result
+        assert result["links"] == {"plan": f"{base}/projects/hr/plans/1"}, result
+        for key in ("issue", "rollout", "approvalStatus", "rolloutCreated"):
+            assert key not in result, (key, result)
+        # The chain stops at the plan: nothing past it is ever called.
+        assert "IssueService/" not in out.stderr, out.stderr
+        assert "RolloutService/" not in out.stderr, out.stderr
 
-        # Asked for, but the approval is still pending: deferred with the
-        # reason, not attempted.
-        result = json.loads(run_cli(
+        # --rollout is gone rather than silently ignored: an agent following a
+        # stale guide must hear that nothing was rolled out.
+        out = run_cli(
             "change", "propose", "employee", "--sql", sql, "--title", "add c", "--rollout",
-        ).stdout)
-        assert result["rolloutDeferredReason"] == "APPROVAL_PENDING", result
-        assert result["rolloutCreated"] is False, result
-        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
-
-        # Approved, checks clean: now the rollout is created and the agent is
-        # sent to watch it.
-        server.state["approval"] = "APPROVED"
-        result = json.loads(run_cli(
-            "change", "propose", "employee", "--sql", sql, "--title", "add c",
-            "--rollout", "--reason", "TICKET-1",
-        ).stdout)
-        assert result["rolloutCreated"] is True, result
-        assert result["rollout"] == "projects/hr/plans/1/rollout", result
-        assert result["nextAction"] == "MONITOR_ROLLOUT", result
-        assert "rolloutDeferredReason" not in result, result
-        assert result["links"]["rollout"] == f"{base}/projects/hr/plans/1/rollout", result
-        server.state["approval"] = "PENDING"
-
-        # CreateIssue answers CHECKING before the approval template is found,
-        # which is what a real server does. Reporting that verbatim stops for
-        # a human on a change that needed no approval, so bbcli waits for the
-        # verdict and reports it -- here SKIPPED, which lifts the rollout gate.
-        server.state["approval_at_create"] = "CHECKING"
-        server.state["approval"] = "SKIPPED"
-        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
-        result = json.loads(out.stdout)
-        assert result["approvalStatus"] == "SKIPPED", result
-        assert result["nextAction"] == "CREATE_ROLLOUT", result
-        assert f"IssueService/GetIssue -> {base}" in out.stderr, out.stderr
-
-        # A settled PENDING is a real request for a human, so it must not cost
-        # the settle wait at all -- no GetIssue is issued.
-        server.state["approval_at_create"] = None
-        server.state["approval"] = "PENDING"
-        out = run_cli("change", "propose", "employee", "--sql", sql, "--title", "add c")
-        result = json.loads(out.stdout)
-        assert result["approvalStatus"] == "PENDING", result
-        assert result["nextAction"] == "AWAIT_HUMAN_APPROVAL", result
-        assert "IssueService/GetIssue" not in out.stderr, out.stderr
-        print("   ok: sheet/plan/checks/issue chain, rollout gates, links, approval settling")
+            expect_fail=True,
+        )
+        assert out.returncode != 0 and "--rollout" in out.stderr, out.stderr
+        print("   ok: sheet/plan/checks chain, --reason on the plan, no issue or rollout")
 
         # --- 2b) config family ---
         step("config (view / use / check / path)")

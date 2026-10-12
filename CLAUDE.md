@@ -64,7 +64,7 @@ These are settled trade-offs, not gaps waiting to be filled.
   method, so a dedicated subcommand has to prove it is not the same call with
   renamed flags. Add one only when at least one of these holds:
   (a) it chains two or more API calls and threads state between them
-  (`change propose`: sheet → plan → plan checks → issue → rollout);
+  (`change propose`: sheet → plan → plan checks);
   (b) it reshapes a response the model cannot read economically (`query`
   flattens `RowValue` oneofs; `schema` summarises and truncates metadata);
   (c) it resolves a resource name the model would otherwise look up on every
@@ -126,8 +126,8 @@ These are settled trade-offs, not gaps waiting to be filled.
   `client::call` unchanged. Codes the friendly subcommands raise themselves
   are UPPER_SNAKE and named after upstream's (`[AMBIGUOUS_TARGET]`,
   `[DATABASE_NOT_FOUND]`, `[TABLE_NOT_FOUND]`, `[AMBIGUOUS_TABLE]`,
-  `[QUERY_ERROR]`, `[SHEET_CREATE_FAILED]`, `[PLAN_CREATE_FAILED]`,
-  `[ISSUE_CREATE_FAILED]`). The case tells the agent who refused: bbcli's own
+  `[QUERY_ERROR]`, `[SHEET_CREATE_FAILED]`, `[PLAN_CREATE_FAILED]`).
+  The case tells the agent who refused: bbcli's own
   resolution, or the server. Both go to stderr with exit 1; stdout stays
   JSON-on-success only.
 
@@ -168,35 +168,28 @@ These are settled trade-offs, not gaps waiting to be filled.
   and would return zero tables. Primary-key columns come from the index with
   `primary: true`; `ColumnMetadata` has no such flag.
 
-- **`change propose` leaves what it created.** The sequence is CreateSheet →
-  CreatePlan → RunPlanChecks (its failure is ignored: CreatePlan already
-  starts checks server-side) → poll `GetPlanCheckRun` for at most 10 s (announced once, not per tick:
-  ten identical attribution lines would bury the trace) →
-  CreateIssue → CreateRollout only with `--rollout` and only when checks and
-  approval allow it. A failure at any step names every resource created so
-  far (`created so far: sheet=..., plan=...`) and cleans up nothing — the
-  agent or a human decides. `nextAction` is one of `AWAIT_HUMAN_APPROVAL`,
-  `CREATE_ROLLOUT`, `MONITOR_ROLLOUT`, `WAIT_PLAN_CHECK`, `FIX_SQL_AND_RETRY`
-  and never names `ApproveIssue`: the agent does not approve on the user's
-  behalf. It is derived from the *settled* approval, not from the one
-  `CreateIssue` answers with — that one is usually `CHECKING`, because the
-  approval template is still being found, and a project with no policy
-  settles to `SKIPPED` milliseconds later. So a `CHECKING` or unset status
-  costs one bounded re-read (3 s, far shorter than the plan-check budget,
-  because a stuck `CHECKING` wants `RetryIssueApproval` rather than a longer
-  wait); `PENDING` is already a verdict and costs nothing. Still unsettled
-  when the budget runs out reports as needing a human, which is the safe
-  direction. The raw `approvalStatus` is in the output next to `nextAction`,
-  because a real `PENDING` and a `CHECKING` that never settled need
-  different things from a person. There is no change-type flag: the server detects MIGRATE vs SDL
-  from the sheet content, and upstream's `changeType` parameter is echoed
-  but unused. `rolloutCreated: false` reports what bbcli did, not what
-  exists: some deployments create the rollout inside `CreatePlan` (observed
-  with identical `createTime`s), so a `NOT_STARTED` task can be there without
-  `--rollout`. Do not "fix" that mismatch by reporting the server's rollout
-  as bbcli's — the field answers "did this command create one", which is what
-  decides whether a retry would duplicate it. SKILL.md tells the agent to
-  check the rollout when it matters.
+- **`change propose` stops at the plan and leaves what it created.** The
+  sequence is CreateSheet → CreatePlan (`--reason` becomes the plan's
+  `description`) → RunPlanChecks (its failure is ignored: CreatePlan already
+  starts checks server-side) → poll `GetPlanCheckRun` for at most 10 s
+  (announced once, not per tick: ten identical attribution lines would bury
+  the trace). Upstream's tool goes on to CreateIssue and CreateRollout; bbcli
+  deliberately does not — in practice the plan is where the change gets
+  picked up, an issue on every proposal was noise, and opening one is a
+  single `IssueService/CreateIssue` call, which is `api`'s job. So there is no
+  `--rollout`, no approval wait, and no `issue`/`approvalStatus` in the
+  output. A failure at any step names every resource created so far
+  (`created so far: sheet=...`) and cleans up nothing — the agent or a human
+  decides. `nextAction` comes from the checks alone: `CREATE_ISSUE` (clean or
+  warnings only), `WAIT_PLAN_CHECK` (still running — read the check run, do
+  not re-propose), `FIX_SQL_AND_RETRY` (an error, or a run that failed
+  outright and so verified nothing); none names an approve or rollout call.
+  There is no change-type flag: the server detects MIGRATE vs SDL from the
+  sheet content, and upstream's `changeType` parameter is echoed but unused.
+  Some deployments create the rollout inside `CreatePlan` (observed with
+  identical `createTime`s), so a `NOT_STARTED` task can exist even though
+  bbcli never asked for one; SKILL.md tells the agent to check the rollout
+  when it matters.
 
 - **Field descriptions print with their continuation lines.** proto3 has no
   `required`, so the resource-name formats and constraints an agent must not

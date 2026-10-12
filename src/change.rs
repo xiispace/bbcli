@@ -1,18 +1,20 @@
-//! `bbcli change propose` — the five-call review flow for a database change,
-//! as one command.
+//! `bbcli change propose` — sheet, plan and plan checks for a database
+//! change, as one command.
 //!
-//! Mirrors upstream's `backend/api/mcp/tool_change.go`: CreateSheet →
-//! CreatePlan → RunPlanChecks → poll GetPlanCheckRun → CreateIssue, then
-//! CreateRollout only when asked and only when the gates allow it. This is the
-//! case a single-call wrapper cannot cover — every step consumes the resource
-//! name the previous one minted, and getting the order or the parents wrong
-//! leaves a half-built change behind.
+//! Follows the first half of upstream's `backend/api/mcp/tool_change.go`:
+//! CreateSheet → CreatePlan → RunPlanChecks → poll GetPlanCheckRun, and stops
+//! at the plan. This is the case a single-call wrapper cannot cover — each
+//! step consumes the resource name the previous one minted, and the check
+//! poll is what turns "the plan exists" into "the plan is fit to go further".
 //!
-//! Two things it deliberately does not do. It does not clean up: a failure
-//! names every resource created so far and stops, because deleting a sheet or
-//! plan someone may want to inspect is not a decision a CLI should make. And
-//! `nextAction` never names `ApproveIssue` — the agent hands the issue link to
-//! a human instead of approving on their behalf.
+//! Upstream goes on to CreateIssue and, when asked, CreateRollout. bbcli does
+//! not: in practice the plan is where people pick the change up, and an issue
+//! created on every proposal is one nobody asked for. Opening one is a single
+//! `IssueService/CreateIssue` call on the plan, which is `bbcli api`'s job.
+//!
+//! It does not clean up: a failure names every resource created so far and
+//! stops, because deleting a sheet someone may want to inspect is not a
+//! decision a CLI should make.
 
 use std::time::Duration;
 
@@ -25,22 +27,11 @@ use serde_json::{json, Value};
 use crate::client::ApiClient;
 use crate::resolve::{self, tool_error};
 
-/// What the agent should do next. `AWAIT_HUMAN_APPROVAL` is a stop, not a
-/// task: approving is the human's, so no value here names an approve call.
-const AWAIT_HUMAN_APPROVAL: &str = "AWAIT_HUMAN_APPROVAL";
-const CREATE_ROLLOUT: &str = "CREATE_ROLLOUT";
-const MONITOR_ROLLOUT: &str = "MONITOR_ROLLOUT";
+/// What the agent should do next. None of them is "approve" or "roll out":
+/// past the plan, the change belongs to the review flow and its humans.
+const CREATE_ISSUE: &str = "CREATE_ISSUE";
 const WAIT_PLAN_CHECK: &str = "WAIT_PLAN_CHECK";
 const FIX_SQL_AND_RETRY: &str = "FIX_SQL_AND_RETRY";
-
-/// Why no rollout was created. Present whenever `rolloutCreated` is false, so
-/// the caller never has to guess between "not asked for" and "refused".
-const NOT_REQUESTED: &str = "NOT_REQUESTED";
-const APPROVAL_PENDING: &str = "APPROVAL_PENDING";
-const APPROVAL_REJECTED: &str = "APPROVAL_REJECTED";
-const PLAN_CHECK_PENDING: &str = "PLAN_CHECK_PENDING";
-const PLAN_CHECK_ERROR: &str = "PLAN_CHECK_ERROR";
-const ROLLOUT_CREATE_FAILED: &str = "ROLLOUT_CREATE_FAILED";
 
 const CHECK_DONE: &str = "DONE";
 const CHECK_RUNNING: &str = "RUNNING";
@@ -48,16 +39,9 @@ const CHECK_FAILED: &str = "FAILED";
 
 /// How long to wait for plan checks before reporting them as still running.
 /// A change is worth a few seconds of waiting — the check result decides
-/// whether a rollout may be created at all — but not an unbounded block.
+/// whether the plan is worth taking further — but not an unbounded block.
 const POLL_BUDGET: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How long to let the server settle `CHECKING` into a real verdict. Much
-/// shorter than the plan-check budget: finding an approval template is a
-/// local decision that takes milliseconds, and one that hangs needs
-/// `RetryIssueApproval`, not a longer wait.
-const APPROVAL_SETTLE_BUDGET: Duration = Duration::from_secs(3);
-const APPROVAL_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -103,9 +87,9 @@ impl PlanCheckInfo {
         }
     }
 
-    /// True when the checks are a reason not to roll out. A `FAILED` run is
-    /// one too: nothing verified the statement, so proceeding would deploy
-    /// unreviewed SQL.
+    /// True when the checks are a reason not to take the plan further. A
+    /// `FAILED` run is one too: nothing verified the statement, so proceeding
+    /// would send unreviewed SQL on.
     fn blocking(&self) -> bool {
         self.status == CHECK_FAILED
             || (self.status == CHECK_DONE && self.summary.as_ref().is_some_and(|s| s.error > 0))
@@ -113,7 +97,6 @@ impl PlanCheckInfo {
 }
 
 /// Runs the whole flow and returns the output document.
-#[allow(clippy::too_many_arguments)]
 pub async fn propose(
     client: &ApiClient,
     database: &str,
@@ -121,13 +104,12 @@ pub async fn propose(
     title: &str,
     instance: Option<&str>,
     project: Option<&str>,
-    rollout: bool,
     reason: Option<&str>,
 ) -> Result<Value> {
     let resolved = resolve::resolve(client, database, instance, project).await?;
     // The project comes from the resolved database, not from --project: that
-    // flag only narrowed the resolution, and the sheet, plan and issue all
-    // have to be parented to the project the database actually lives in.
+    // flag only narrowed the resolution, and the sheet and plan both have to
+    // be parented to the project the database actually lives in.
     let project_name = resolved.project.clone();
 
     let sheet = create_named(
@@ -139,128 +121,38 @@ pub async fn propose(
         }),
     )
     .await
-    .map_err(|e| step_error("SHEET_CREATE_FAILED", &e, &[], None))?;
+    .map_err(|e| step_error("SHEET_CREATE_FAILED", &e, &[]))?;
 
+    let mut plan = json!({
+        "title": title,
+        "specs": [{
+            "id": "spec-1",
+            "changeDatabaseConfig": {"targets": [resolved.name], "sheet": sheet},
+        }],
+    });
+    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+        plan["description"] = json!(reason);
+    }
     let plan = create_named(
         client,
         "PlanService/CreatePlan",
-        &json!({
-            "parent": project_name,
-            "plan": {
-                "title": title,
-                "specs": [{
-                    "id": "spec-1",
-                    "changeDatabaseConfig": {"targets": [resolved.name], "sheet": sheet},
-                }],
-            },
-        }),
+        &json!({"parent": project_name, "plan": plan}),
     )
     .await
-    .map_err(|e| step_error("PLAN_CREATE_FAILED", &e, &[("sheet", &sheet)], None))?;
+    .map_err(|e| step_error("PLAN_CREATE_FAILED", &e, &[("sheet", &sheet)]))?;
 
     let checks = run_plan_checks(client, &plan).await;
+    let next_action = derive_next_action(&checks);
 
-    let mut issue = json!({
-        "title": title,
-        "type": "DATABASE_CHANGE",
-        "plan": plan,
-    });
-    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
-        issue["description"] = json!(reason);
-    }
-    let issue = client
-        .call_announced(
-            "IssueService/CreateIssue",
-            &json!({"parent": project_name, "issue": issue}),
-        )
-        .await
-        .map_err(|e| {
-            // A failure here is very often the SQL review gate, which the plan
-            // checks already reported. Say so, or the agent retries the same
-            // statement against the same gate.
-            let hint = checks.blocking().then_some(
-                "plan checks must pass before an issue can be created; fix the SQL and retry",
-            );
-            step_error(
-                "ISSUE_CREATE_FAILED",
-                &e,
-                &[("sheet", &sheet), ("plan", &plan)],
-                hint,
-            )
-        })?;
-    let created_approval = issue
-        .get("approvalStatus")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let issue = resource_name(&issue).context("CreateIssue returned no resource name")?;
-    let approval = settle_approval(client, &issue, created_approval).await;
-
-    let mut next_action = derive_next_action(&approval);
-    let mut rollout_created = false;
-    let mut rollout_name = None;
-    let mut deferred = None;
-
-    match rollout_decision(rollout, &checks, &approval) {
-        Rollout::Deferred { reason, next } => {
-            deferred = Some(reason);
-            if let Some(next) = next {
-                next_action = next;
-            }
-        }
-        // The parent of a rollout is the plan, not the project — the catalog
-        // says so, and the vendored guide's project-parent form is stale.
-        Rollout::Attempt => match create_named(
-            client,
-            "RolloutService/CreateRollout",
-            &json!({"parent": plan}),
-        )
-        .await
-        {
-            Ok(name) => {
-                rollout_created = true;
-                rollout_name = Some(name);
-                next_action = MONITOR_ROLLOUT;
-            }
-            Err(e) => {
-                // The change itself exists and is approved; only the rollout
-                // failed. Warn and keep the approval-derived next action
-                // rather than inventing one.
-                eprintln!("warning: rollout creation failed: {e:#}");
-                deferred = Some(ROLLOUT_CREATE_FAILED);
-            }
-        },
-    }
-
-    let server = client.server();
-    let mut links = json!({
-        "issue": format!("{server}/{issue}"),
-        "plan": format!("{server}/{plan}"),
-    });
-    let mut output = json!({
+    Ok(json!({
         "database": resolved.name,
         "project": project_name,
         "sheet": sheet,
         "plan": plan,
         "planChecks": checks,
-        "issue": issue,
-        // The server's own verdict, alongside the action derived from it. An
-        // agent that only sees AWAIT_HUMAN_APPROVAL cannot tell a real
-        // PENDING from a CHECKING that never settled, and those need
-        // different things from a person.
-        "approvalStatus": approval,
-        "rolloutCreated": rollout_created,
         "nextAction": next_action,
-    });
-    if let Some(rollout) = &rollout_name {
-        links["rollout"] = json!(format!("{server}/{rollout}"));
-        output["rollout"] = json!(rollout);
-    }
-    if let Some(deferred) = deferred {
-        output["rolloutDeferredReason"] = json!(deferred);
-    }
-    output["links"] = links;
-    Ok(output)
+        "links": {"plan": format!("{}/{plan}", client.server())},
+    }))
 }
 
 /// Calls a create method and returns the new resource's name.
@@ -306,7 +198,7 @@ async fn run_plan_checks(client: &ApiClient, plan: &str) -> PlanCheckInfo {
     while tokio::time::Instant::now() < deadline {
         // A poll error is transient by assumption (the row is not visible
         // yet, a brief 500) and retried inside the budget: the run's real
-        // status is what decides whether a rollout is allowed.
+        // status is what decides the next action.
         if let Ok(resp) = client
             .call("PlanService/GetPlanCheckRun", &json!({"name": check_run}))
             .await
@@ -365,142 +257,29 @@ fn build_plan_check_info(run: &Value, check_run: &str) -> PlanCheckInfo {
     }
 }
 
-/// Whether `status` is the server's verdict rather than a step on the way to
-/// one. `CHECKING` and an unset status are not: the approval template is
-/// still being found. `PENDING` is — it means a human really was asked.
-///
-/// Anything unrecognised counts as settled. A status this binary has not
-/// heard of already stops for a human (see `derive_next_action`), so waiting
-/// on it would buy nothing but the wait.
-fn approval_settled(status: &str) -> bool {
-    !matches!(status, "" | "APPROVAL_STATUS_UNSPECIFIED" | "CHECKING")
-}
-
-/// Waits briefly for the server to finish deciding whether this change needs
-/// a human at all.
-///
-/// `CreateIssue` answers before the approval template has been found, so its
-/// `approvalStatus` is usually `CHECKING`. Reporting that as
-/// `AWAIT_HUMAN_APPROVAL` sends someone to look at an issue that needed no
-/// approval: a project with no policy settles to `SKIPPED` in milliseconds,
-/// and the agent stops for nothing.
-///
-/// The budget is short because `CHECKING` can genuinely get stuck, which is
-/// what `IssueService/RetryIssueApproval` exists for. Still unsettled when it
-/// runs out is reported as needing a human, which is the safe direction to
-/// be wrong in.
-async fn settle_approval(client: &ApiClient, issue: &str, created: String) -> String {
-    if approval_settled(&created) {
-        return created;
-    }
-    client.announce("IssueService/GetIssue");
-    eprintln!(
-        "  approval is {}, waiting up to {}s for the server to settle it",
-        if created.is_empty() {
-            "unset"
-        } else {
-            &created
-        },
-        APPROVAL_SETTLE_BUDGET.as_secs()
-    );
-
-    let deadline = tokio::time::Instant::now() + APPROVAL_SETTLE_BUDGET;
-    loop {
-        // Read before sleeping: the server usually settles in milliseconds,
-        // and a leading sleep would spend the whole interval finding that out.
-        if let Ok(resp) = client
-            .call("IssueService/GetIssue", &json!({"name": issue}))
-            .await
-        {
-            if let Some(status) = resp.get("approvalStatus").and_then(Value::as_str) {
-                if approval_settled(status) {
-                    return status.to_string();
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return created;
-        }
-        tokio::time::sleep(APPROVAL_SETTLE_INTERVAL).await;
-    }
-}
-
-/// What to do after the issue exists, from the approval the server assigned.
-fn derive_next_action(approval: &str) -> &'static str {
-    match approval {
-        "APPROVED" | "SKIPPED" => CREATE_ROLLOUT,
-        "REJECTED" => FIX_SQL_AND_RETRY,
-        // PENDING, CHECKING, unset, or a status this binary does not know:
-        // stop and let a human look. Guessing "go ahead" here would deploy a
-        // change nobody approved.
-        _ => AWAIT_HUMAN_APPROVAL,
-    }
-}
-
-/// Whether to attempt the rollout, or why not.
-#[derive(Debug, PartialEq)]
-enum Rollout {
-    Deferred {
-        reason: &'static str,
-        /// Set when the reason also changes what to do next.
-        next: Option<&'static str>,
-    },
-    Attempt,
-}
-
-/// The gate order matters: the most specific blocker wins, so the reported
-/// reason is the one a caller has to act on. Checks come before approval
-/// because a failing check cannot be approved away.
-fn rollout_decision(requested: bool, checks: &PlanCheckInfo, approval: &str) -> Rollout {
-    if !requested {
-        return Rollout::Deferred {
-            reason: NOT_REQUESTED,
-            next: None,
-        };
-    }
+/// What to do with the plan, from its checks. Only a clean or warning-only
+/// verdict sends the change on; checks still running are a wait, not a
+/// refusal, so the agent is not sent to rewrite SQL that may be fine.
+fn derive_next_action(checks: &PlanCheckInfo) -> &'static str {
     if checks.status == CHECK_RUNNING {
-        return Rollout::Deferred {
-            reason: PLAN_CHECK_PENDING,
-            next: Some(WAIT_PLAN_CHECK),
-        };
-    }
-    if checks.blocking() {
-        return Rollout::Deferred {
-            reason: PLAN_CHECK_ERROR,
-            next: Some(FIX_SQL_AND_RETRY),
-        };
-    }
-    match approval {
-        "PENDING" | "CHECKING" => Rollout::Deferred {
-            reason: APPROVAL_PENDING,
-            next: Some(AWAIT_HUMAN_APPROVAL),
-        },
-        "REJECTED" => Rollout::Deferred {
-            reason: APPROVAL_REJECTED,
-            next: Some(FIX_SQL_AND_RETRY),
-        },
-        _ => Rollout::Attempt,
+        WAIT_PLAN_CHECK
+    } else if checks.blocking() {
+        FIX_SQL_AND_RETRY
+    } else {
+        CREATE_ISSUE
     }
 }
 
 /// A step failure that names every resource already created.
 ///
 /// Nothing is rolled back, so this list is the only record of what exists:
-/// without it the next attempt either orphans a sheet and plan or duplicates
-/// them. The agent or a human decides which.
-fn step_error(
-    code: &str,
-    err: &anyhow::Error,
-    created: &[(&str, &str)],
-    hint: Option<&str>,
-) -> anyhow::Error {
+/// without it the next attempt either orphans a sheet or duplicates it. The
+/// agent or a human decides which.
+fn step_error(code: &str, err: &anyhow::Error, created: &[(&str, &str)]) -> anyhow::Error {
     let mut msg = format!("{err:#}");
     if !created.is_empty() {
         let refs: Vec<String> = created.iter().map(|(k, v)| format!("{k}={v}")).collect();
         msg.push_str(&format!("\n  created so far: {}", refs.join(", ")));
-    }
-    if let Some(hint) = hint {
-        msg.push_str(&format!("\n  {hint}"));
     }
     tool_error(code, msg)
 }
@@ -518,151 +297,50 @@ mod tests {
         }
     }
 
-    /// `CHECKING` is the server still deciding, not a decision. Treating it
-    /// as one reports AWAIT_HUMAN_APPROVAL for a change that needed no
-    /// approval at all, which is a person interrupted for nothing. `PENDING`
-    /// is the opposite: a real request for a human, and waiting on it would
-    /// burn the budget every time.
+    /// Warnings are advice, not a verdict: a plan with only warnings goes on
+    /// to review like a clean one, or every index hint would stall a change.
     #[test]
-    fn checking_is_not_a_verdict_but_pending_is() {
-        assert!(!approval_settled("CHECKING"));
-        assert!(!approval_settled(""));
-        assert!(!approval_settled("APPROVAL_STATUS_UNSPECIFIED"));
-
-        assert!(approval_settled("PENDING"));
-        assert!(approval_settled("APPROVED"));
-        assert!(approval_settled("REJECTED"));
-        assert!(approval_settled("SKIPPED"));
-        // An unrecognised status already stops for a human, so waiting on it
-        // would buy the wait and nothing else.
-        assert!(approval_settled("SOMETHING_NEW"));
-    }
-
-    /// The settle wait exists to turn this pairing around: `CHECKING` at
-    /// creation stops for a human, and the same issue moments later does not.
-    #[test]
-    fn a_status_that_settles_late_changes_the_next_action() {
-        assert_eq!(derive_next_action("CHECKING"), AWAIT_HUMAN_APPROVAL);
-        assert_eq!(derive_next_action("SKIPPED"), CREATE_ROLLOUT);
-        // ...and with --rollout, the same settling is what lifts the gate.
-        assert_eq!(
-            rollout_decision(true, &done(0, 0), "CHECKING"),
-            Rollout::Deferred {
-                reason: APPROVAL_PENDING,
-                next: Some(AWAIT_HUMAN_APPROVAL)
-            }
-        );
-        assert_eq!(
-            rollout_decision(true, &done(0, 0), "SKIPPED"),
-            Rollout::Attempt
-        );
-    }
-
-    /// The agent must never approve on the user's behalf, so every status that
-    /// is not already settled has to land on a stop. An unknown status is the
-    /// dangerous case: treated as approval it would deploy unreviewed SQL.
-    #[test]
-    fn only_an_approved_or_skipped_issue_moves_on_without_a_human() {
-        assert_eq!(derive_next_action("APPROVED"), CREATE_ROLLOUT);
-        assert_eq!(derive_next_action("SKIPPED"), CREATE_ROLLOUT);
-        assert_eq!(derive_next_action("REJECTED"), FIX_SQL_AND_RETRY);
-        assert_eq!(derive_next_action("PENDING"), AWAIT_HUMAN_APPROVAL);
-        assert_eq!(derive_next_action("CHECKING"), AWAIT_HUMAN_APPROVAL);
-        assert_eq!(derive_next_action(""), AWAIT_HUMAN_APPROVAL);
-        assert_eq!(derive_next_action("SOMETHING_NEW"), AWAIT_HUMAN_APPROVAL);
-        // No next action may send the agent at an approve call.
-        for status in ["APPROVED", "REJECTED", "PENDING", ""] {
-            assert!(!derive_next_action(status).contains("APPROVE"));
-        }
-    }
-
-    #[test]
-    fn without_rollout_nothing_is_attempted_and_the_output_says_why() {
-        assert_eq!(
-            rollout_decision(false, &done(0, 0), "APPROVED"),
-            Rollout::Deferred {
-                reason: NOT_REQUESTED,
-                next: None
-            },
-            "not asking for a rollout must not change the approval-derived next action"
-        );
+    fn clean_or_warning_only_checks_send_the_plan_on_to_an_issue() {
+        assert_eq!(derive_next_action(&done(0, 0)), CREATE_ISSUE);
+        assert_eq!(derive_next_action(&done(0, 3)), CREATE_ISSUE);
     }
 
     /// Checks still running are not a refusal, so the caller is told to wait
-    /// rather than to fix anything.
+    /// rather than to rewrite SQL that may well be fine.
     #[test]
-    fn checks_still_running_defer_the_rollout_and_ask_for_a_wait() {
+    fn checks_still_running_ask_for_a_wait_not_a_fix() {
         let running = PlanCheckInfo::running("p/planCheckRun");
+        assert_eq!(derive_next_action(&running), WAIT_PLAN_CHECK);
+    }
+
+    /// An error means the SQL is wrong, and a run that failed outright
+    /// verified nothing — both send the agent back to the statement instead
+    /// of on to review.
+    #[test]
+    fn check_errors_or_a_failed_run_send_the_agent_back_to_the_sql() {
+        assert_eq!(derive_next_action(&done(1, 0)), FIX_SQL_AND_RETRY);
         assert_eq!(
-            rollout_decision(true, &running, "APPROVED"),
-            Rollout::Deferred {
-                reason: PLAN_CHECK_PENDING,
-                next: Some(WAIT_PLAN_CHECK)
-            }
+            derive_next_action(&PlanCheckInfo::failed()),
+            FIX_SQL_AND_RETRY
         );
     }
 
-    /// A failing check cannot be approved away, so it outranks the approval
-    /// status — otherwise an approved-but-broken change would roll out.
+    /// Past the plan the change belongs to humans, so no next action may send
+    /// the agent at an approve or a rollout call.
     #[test]
-    fn check_errors_outrank_an_approval_and_send_the_agent_back_to_the_sql() {
-        assert_eq!(
-            rollout_decision(true, &done(1, 0), "APPROVED"),
-            Rollout::Deferred {
-                reason: PLAN_CHECK_ERROR,
-                next: Some(FIX_SQL_AND_RETRY)
-            }
-        );
-        // A run that failed outright verified nothing, which blocks too.
-        assert_eq!(
-            rollout_decision(true, &PlanCheckInfo::failed(), "APPROVED"),
-            Rollout::Deferred {
-                reason: PLAN_CHECK_ERROR,
-                next: Some(FIX_SQL_AND_RETRY)
-            }
-        );
-        // Warnings are not errors and must not block.
-        assert_eq!(
-            rollout_decision(true, &done(0, 3), "APPROVED"),
-            Rollout::Attempt
-        );
-    }
-
-    #[test]
-    fn a_pending_approval_defers_the_rollout_to_the_human() {
-        for status in ["PENDING", "CHECKING"] {
-            assert_eq!(
-                rollout_decision(true, &done(0, 0), status),
-                Rollout::Deferred {
-                    reason: APPROVAL_PENDING,
-                    next: Some(AWAIT_HUMAN_APPROVAL)
-                },
-                "{status}"
+    fn no_next_action_approves_or_rolls_out() {
+        for checks in [
+            done(0, 0),
+            done(1, 0),
+            PlanCheckInfo::failed(),
+            PlanCheckInfo::running("p"),
+        ] {
+            let next = derive_next_action(&checks);
+            assert!(
+                !next.contains("APPROVE") && !next.contains("ROLLOUT"),
+                "{next}"
             );
         }
-    }
-
-    #[test]
-    fn a_rejected_approval_defers_the_rollout_and_names_the_rejection() {
-        assert_eq!(
-            rollout_decision(true, &done(0, 0), "REJECTED"),
-            Rollout::Deferred {
-                reason: APPROVAL_REJECTED,
-                next: Some(FIX_SQL_AND_RETRY)
-            }
-        );
-    }
-
-    #[test]
-    fn an_approved_change_with_clean_checks_is_eligible_for_a_rollout() {
-        assert_eq!(
-            rollout_decision(true, &done(0, 0), "APPROVED"),
-            Rollout::Attempt
-        );
-        assert_eq!(
-            rollout_decision(true, &done(0, 0), "SKIPPED"),
-            Rollout::Attempt
-        );
     }
 
     /// Only the entries that change a decision survive. A list of successful
@@ -692,7 +370,7 @@ mod tests {
         assert_eq!(info.results[1].message, "column does not exist");
         // ...and a present title wins over content.
         assert_eq!(info.results[2].message, "naming convention");
-        assert!(info.blocking(), "errors must block a rollout");
+        assert!(info.blocking(), "errors must stop the plan going further");
         assert_eq!(info.plan_check_run.as_deref(), Some("p/planCheckRun"));
 
         let clean = build_plan_check_info(&json!({"status": "DONE"}), "p/planCheckRun");
@@ -712,7 +390,7 @@ mod tests {
     fn a_step_failure_names_every_resource_created_so_far() {
         let cause = anyhow::anyhow!("HTTP 403 [permission_denied]: nope");
 
-        let sheet_failed = step_error("SHEET_CREATE_FAILED", &cause, &[], None).to_string();
+        let sheet_failed = step_error("SHEET_CREATE_FAILED", &cause, &[]).to_string();
         assert!(
             sheet_failed.starts_with("[SHEET_CREATE_FAILED]"),
             "{sheet_failed}"
@@ -726,39 +404,15 @@ mod tests {
             "PLAN_CREATE_FAILED",
             &cause,
             &[("sheet", "projects/hr/sheets/1")],
-            None,
         )
         .to_string();
         assert!(
             plan_failed.contains("created so far: sheet=projects/hr/sheets/1"),
             "{plan_failed}"
         );
-
-        let issue_failed = step_error(
-            "ISSUE_CREATE_FAILED",
-            &cause,
-            &[
-                ("sheet", "projects/hr/sheets/1"),
-                ("plan", "projects/hr/plans/1"),
-            ],
-            Some("plan checks must pass before an issue can be created; fix the SQL and retry"),
-        )
-        .to_string();
-        assert!(
-            issue_failed
-                .contains("created so far: sheet=projects/hr/sheets/1, plan=projects/hr/plans/1"),
-            "{issue_failed}"
-        );
-        assert!(
-            issue_failed.contains("plan checks must pass"),
-            "{issue_failed}"
-        );
         // The server's own code survives inside bbcli's: it is what decides
         // whether to ask for access or fix the request.
-        assert!(
-            issue_failed.contains("[permission_denied]"),
-            "{issue_failed}"
-        );
+        assert!(plan_failed.contains("[permission_denied]"), "{plan_failed}");
     }
 
     /// The sheet is the statement. Any other encoding stores something that is

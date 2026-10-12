@@ -164,7 +164,7 @@ bbcli skill query                              # bundled task guide
 |---|---|
 | `query <database> <statement> [--file F] [--instance I] [--project P] [--limit N]` | Run one read-only statement: resolves the database by name, picks the READ_ONLY data source, and flattens the rows into plain JSON with an exact `truncated` flag |
 | `schema <database> [--instance I] [--project P] [--schema S] [--table T] [--include summary\|columns\|details]` | Schema of a database: a compact per-table overview, or one table with its columns, indexes and foreign keys (`--table` implies `--include details`) |
-| `change propose <database> (--sql TEXT \| --file F) --title T [--rollout] [--reason R]` | The review flow in one command: sheet → plan → plan checks → issue, and a rollout only with `--rollout` and only when checks and approval allow it. Reports `nextAction` and, when no rollout was created, why |
+| `change propose <database> (--sql TEXT \| --file F) --title T [--reason R]` | Sheet → plan → plan checks in one command, stopping at the plan (no issue, no rollout; open those with `api`). Reports the check verdict and `nextAction` |
 | `api <Service/Method> [--args JSON \| --args-file F]` | Direct Connect call, prints the JSON response; non-2xx exits 1 with the server's message |
 | `search [--service S \| --operation-id O \| --schema T]` | Offline API catalog (embedded OpenAPI spec) |
 | `skill [name]` | Offline task guides (query, database-change, grant-permission) |
@@ -300,7 +300,7 @@ glance — lowercase came from Bytebase, uppercase from bbcli:
 `AMBIGUOUS_TARGET`, `DATABASE_NOT_FOUND`, `TABLE_NOT_FOUND`,
 `AMBIGUOUS_TABLE` and `QUERY_ERROR` each name what to change. The
 `*_CREATE_FAILED` codes from `change propose` also list what already exists
-(`created so far: sheet=..., plan=...`) — nothing is rolled back, so those
+(`created so far: sheet=...`) — nothing is rolled back, so those
 resources are yours to reuse or clean up.
 
 ## Limitations
@@ -329,7 +329,7 @@ The E2E script spins up an in-process mock of the OAuth2 endpoints and a
 Connect endpoint, and verifies the full lifecycle: login (registration + PKCE
 + code exchange), `api` calls (args/args-file/error propagation), the friendly
 commands (`query` resolution and truncation, `schema` summary vs drill-down,
-the `change propose` chain and its rollout gates), 401-triggered refresh and
+the `change propose` chain stopping at the plan), 401-triggered refresh and
 replay, cross-process refresh-token adoption, and logout/revocation.
 
 CI (`.github/workflows/ci.yml`) runs clippy and the unit tests on Linux, macOS
