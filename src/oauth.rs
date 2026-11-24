@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::store::Credentials;
+use crate::store::{Credentials, Grant};
 
 /// Refresh tokens are server-issued with a 30-day lifetime
 /// (`backend/api/oauth2/oauth2.go: refreshTokenExpiry`), but the token
@@ -135,27 +135,24 @@ impl OAuth2Client {
 
     /// Exchanges the (single-use) refresh token for a fresh token pair. On
     /// `invalid_grant` the only recovery is a new `login`.
-    pub async fn refresh(&self, creds: &Credentials) -> Result<Credentials> {
+    pub async fn refresh(&self, client_id: &str, refresh_token: &str) -> Result<Credentials> {
         self.token_request(
-            &creds.client_id,
-            Some(&creds.refresh_token),
+            client_id,
+            Some(refresh_token),
             &[
                 ("grant_type", "refresh_token"),
-                ("refresh_token", creds.refresh_token.as_str()),
+                ("refresh_token", refresh_token),
             ],
         )
         .await
     }
 
-    pub async fn revoke(&self, creds: &Credentials) -> Result<()> {
+    pub async fn revoke(&self, client_id: &str, refresh_token: &str) -> Result<()> {
         let resp = self
             .http
             .post(format!("{}/api/oauth2/revoke", self.server))
             .timeout(OAUTH_TIMEOUT)
-            .form(&[
-                ("token", creds.refresh_token.as_str()),
-                ("client_id", creds.client_id.as_str()),
-            ])
+            .form(&[("token", refresh_token), ("client_id", client_id)])
             .send()
             .await
             .context("revoke request failed")?;
@@ -202,11 +199,13 @@ impl OAuth2Client {
             .ok_or_else(|| anyhow!("token response carried no refresh token"))?;
         let now = crate::store::unix_now();
         Ok(Credentials {
-            client_id: client_id.to_string(),
             access_token: r.access_token,
-            refresh_token,
             expires_at: now + r.expires_in,
-            refresh_expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
+            grant: Grant::OAuth {
+                client_id: client_id.to_string(),
+                refresh_token,
+                refresh_expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
+            },
         })
     }
 }

@@ -195,16 +195,23 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Authenticate via OAuth2 (browser) and store tokens locally
+    /// Authenticate via OAuth2 (browser), or as a service account, and
+    /// store tokens locally
     Login {
         /// Name this server as a context (e.g. --as prod), usable with
         /// --context, BBCLI_SERVER, `config use`, and .bbcli files
         #[arg(long = "as")]
         r#as: Option<String>,
+        /// Log in as this Bytebase service account instead of through the
+        /// browser, so an agent acts under the account's narrower roles. The
+        /// key (bbs_...) is read from stdin — never pass it as an argument
+        #[arg(long, value_name = "EMAIL")]
+        service_account: Option<String>,
     },
     /// Show stored credentials and token expiry
     Status,
-    /// Revoke and remove stored credentials
+    /// Remove stored credentials, revoking an OAuth refresh token
+    /// server-side (a service key stays valid until rotated in Bytebase)
     Logout,
 }
 
@@ -405,12 +412,20 @@ async fn main() -> Result<()> {
                  so that is what keeps the installed copy in sync."
             );
         }
-        Command::Login { r#as } => {
+        Command::Login {
+            r#as,
+            service_account,
+        } => {
             let server = cli
                 .context
                 .clone()
                 .ok_or_else(|| anyhow!("--context (or BBCLI_SERVER) is required for login"))?;
-            login(&server, r#as.as_deref(), cli.insecure, cli.no_browser).await?;
+            match service_account {
+                Some(email) => {
+                    login_service_account(&server, &email, r#as.as_deref(), cli.insecure).await?
+                }
+                None => login(&server, r#as.as_deref(), cli.insecure, cli.no_browser).await?,
+            }
         }
         Command::Config { action } => match action {
             ConfigAction::View => config_view(cli.context.as_deref(), context_from_env)?,
@@ -665,6 +680,94 @@ async fn login(server: &str, alias: Option<&str>, insecure: bool, no_browser: bo
     Ok(())
 }
 
+/// `login --service-account`: one `AuthService/Login` with the key, then the
+/// same storage path as a browser login, so contexts, `.bbcli` files and
+/// `logout` treat both identities alike.
+async fn login_service_account(
+    server: &str,
+    email: &str,
+    alias: Option<&str>,
+    insecure: bool,
+) -> Result<()> {
+    let client = OAuth2Client::new(server, insecure)?;
+    let key = read_secret(&format!("Service key for {email}: "))?;
+    let creds = client::service_account_login(&client.http, &client.server, email, &key).await?;
+    store::save_credentials(server, &creds, alias)?;
+    let key_name = store::normalize(server);
+    let context = alias
+        .map(|a| format!(" as context {a}"))
+        .unwrap_or_default();
+    eprintln!(
+        "Logged in to {key_name}{context} as service account {email}; access token valid for {} \
+         minutes, renewed with the stored key after that.",
+        (creds.expires_at - store::unix_now()) / 60
+    );
+    Ok(())
+}
+
+/// Reads one line from stdin, without echo when stdin is a terminal. The key
+/// stays off argv (visible in `ps`) and shell history; piping it in
+/// (`op read ... | bbcli login ...`) works the same way.
+fn read_secret(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    if tty {
+        eprint!("{prompt}");
+    }
+    let mut line = String::new();
+    {
+        // Off Unix there is no echo control: the key is still read from
+        // stdin, just visibly.
+        #[cfg(unix)]
+        let _echo = tty.then(EchoOff::new).flatten();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .context("failed to read the service key from stdin")?;
+    }
+    if tty {
+        eprintln!();
+    }
+    let key = line.trim().to_string();
+    if key.is_empty() {
+        bail!("no service key on stdin");
+    }
+    Ok(key)
+}
+
+/// Turns terminal echo off for its lifetime and restores it on drop, so a
+/// failed read cannot leave the terminal silent. Ctrl-C kills the process
+/// without running drops; the shell restores echo at its next prompt.
+#[cfg(unix)]
+struct EchoOff(libc::termios);
+
+#[cfg(unix)]
+impl EchoOff {
+    fn new() -> Option<Self> {
+        // SAFETY: termios is plain data; tcgetattr fills it or fails.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+                return None;
+            }
+            let saved = t;
+            t.c_lflag &= !libc::ECHO;
+            (libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) == 0).then_some(Self(saved))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes tcgetattr returned.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+        }
+    }
+}
+
 fn status() -> Result<()> {
     let file = store::load()?;
     if file.servers.is_empty() {
@@ -682,15 +785,36 @@ fn status() -> Result<()> {
             ""
         };
         println!("{key}{default}");
-        println!("  client_id:     {}", c.client_id);
-        println!(
-            "  access token:  {}",
-            fmt_remaining(c.expires_at - now, Expired::Recoverable)
-        );
-        println!(
-            "  refresh token: {}",
-            fmt_remaining(c.refresh_expires_at - now, Expired::Terminal)
-        );
+        match &c.grant {
+            store::Grant::OAuth {
+                client_id,
+                refresh_expires_at,
+                ..
+            } => {
+                println!("  client_id:     {client_id}");
+                println!(
+                    "  access token:  {}",
+                    fmt_remaining(c.expires_at - now, Expired::Recoverable)
+                );
+                println!(
+                    "  refresh token: {}",
+                    fmt_remaining(refresh_expires_at - now, Expired::Terminal)
+                );
+            }
+            // No refresh token, so no terminal expiry to report: the key
+            // renews the access token until it is rotated in Bytebase, and
+            // only a failed renewal says that happened.
+            store::Grant::ServiceAccount {
+                service_account, ..
+            } => {
+                println!("  service account: {service_account}");
+                println!(
+                    "  access token:    {}",
+                    fmt_remaining(c.expires_at - now, Expired::Recoverable)
+                );
+                println!("  renewal:         stored key (valid until rotated in Bytebase)");
+            }
+        }
     }
     Ok(())
 }
@@ -729,11 +853,28 @@ async fn logout(server: &str, insecure: bool) -> Result<()> {
         println!("No stored credentials for {key}.");
         return Ok(());
     };
-    let client = OAuth2Client::new(server, insecure)?;
-    if let Err(e) = client.revoke(&creds).await {
-        println!("Logged out from {key} locally; server revoke failed ({e:#}).");
-    } else {
-        println!("Logged out from {key}.");
+    match &creds.grant {
+        store::Grant::OAuth {
+            client_id,
+            refresh_token,
+            ..
+        } => {
+            let client = OAuth2Client::new(server, insecure)?;
+            if let Err(e) = client.revoke(client_id, refresh_token).await {
+                println!("Logged out from {key} locally; server revoke failed ({e:#}).");
+            } else {
+                println!("Logged out from {key}.");
+            }
+        }
+        // Nothing to revoke from here: the access token is a stateless JWT
+        // and the key is managed in Bytebase. Say so, or "logged out" reads
+        // as "the key is dead" when it is not.
+        store::Grant::ServiceAccount {
+            service_account, ..
+        } => println!(
+            "Logged out from {key} locally. The service key for {service_account} is still \
+             valid; rotate or delete it in Bytebase to revoke it."
+        ),
     }
     Ok(())
 }

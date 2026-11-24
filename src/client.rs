@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::oauth::OAuth2Client;
-use crate::store::{self, Credentials};
+use crate::store::{self, Credentials, Grant};
 
 /// Refresh this early before the access token's `exp` to avoid a 401 round
 /// trip on the API call.
@@ -176,7 +176,11 @@ impl ApiClient {
     /// until the winner's rotation is durable, adopts the rotated token, and
     /// skips its own network refresh instead of burning the now-dead one.
     /// Lock order is always memory lock -> file lock, matching `login`'s
-    /// writer.
+    /// writer. A service account has no rotation to race, but renewing under
+    /// the same lock still means a successful re-login is shared: processes
+    /// queued behind it adopt the new token instead of each logging in. A
+    /// failed one is not shared — the file is unchanged, so the next process
+    /// tries the same key again.
     async fn refresh_locked(&self, creds: &mut Credentials, force: bool) -> Result<()> {
         let key = self.oauth.server.clone();
         store::edit_tokens(move |mut tf| async move {
@@ -186,13 +190,99 @@ impl ApiClient {
             if !force && creds.expires_at - store::unix_now() >= REFRESH_MARGIN_SECS {
                 return Ok((tf, ())); // adopted token is fresh; file unchanged
             }
-            let fresh = self.oauth.refresh(creds).await?;
+            let fresh = match &creds.grant {
+                Grant::OAuth {
+                    client_id,
+                    refresh_token,
+                    ..
+                } => self.oauth.refresh(client_id, refresh_token).await?,
+                Grant::ServiceAccount {
+                    service_account,
+                    service_key,
+                } => service_account_login(&self.http, &key, service_account, service_key).await?,
+            };
             tf.servers.insert(key, fresh.clone());
             *creds = fresh;
             Ok((tf, ()))
         })
         .await
     }
+}
+
+/// Exchanges a service account's key for an access token through
+/// `AuthService/Login` — the same call the Bytebase UI makes, with the key in
+/// the password field and `web: false` so the token comes back in the body
+/// rather than as a cookie. The key never appears in an error: on failure
+/// only the server's Connect error is surfaced.
+pub async fn service_account_login(
+    http: &reqwest::Client,
+    server: &str,
+    email: &str,
+    key: &str,
+) -> Result<Credentials> {
+    const PATH: &str = "/bytebase.v1.AuthService/Login";
+    let resp = http
+        .post(format!("{server}{PATH}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("connect-protocol-version", "1")
+        // A login is a short request/response even when API calls on the
+        // same client may run for minutes.
+        .timeout(std::time::Duration::from_secs(30))
+        .body(serde_json::to_string(
+            &serde_json::json!({"email": email, "password": key, "web": false}),
+        )?)
+        .send()
+        .await
+        .with_context(|| format!("service account login for {email} failed"))?;
+    let status = resp.status();
+    let body = resp.text().await.context("failed to read login response")?;
+    if !status.is_success() {
+        bail!(
+            "service account login for {email} failed: {}",
+            connect_error_with(status, PATH, &body, service_account_hint)
+        );
+    }
+    let v: Value = serde_json::from_str(&body).context("failed to parse login response")?;
+    let Some(token) = v
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    else {
+        // Service accounts skip MFA server-side, so an empty token means the
+        // email named an ordinary user, not a service account.
+        bail!(
+            "login for {email} returned no token — is it a service account? \
+             Ordinary users log in with `bbcli login` (browser)"
+        );
+    };
+    let now = store::unix_now();
+    Ok(Credentials {
+        access_token: token.to_string(),
+        // The response carries no lifetime; the JWT's own `exp` is exact.
+        // Bytebase issues service-account tokens for 1 hour
+        // (`backend/api/auth/auth.go: apiTokenDuration`), the fallback should
+        // the token ever stop being a readable JWT; a wrong guess only costs
+        // a 401 and a re-login.
+        expires_at: jwt_exp(token).unwrap_or(now + 3600),
+        grant: Grant::ServiceAccount {
+            service_account: email.to_string(),
+            service_key: key.to_string(),
+        },
+    })
+}
+
+/// The `exp` claim of a JWT, read without verifying the signature — bbcli
+/// only uses it to schedule renewal, never to trust the token.
+fn jwt_exp(token: &str) -> Option<i64> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 /// Renders a Connect error body into one actionable line.
@@ -204,6 +294,17 @@ impl ApiClient {
 /// refused. Both are preserved here so the caller does not have to infer
 /// intent from prose.
 fn connect_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
+    connect_error_with(status, path, body, recovery_hint)
+}
+
+/// `connect_error` with the hint table swapped. Used where the generic hint
+/// would send the reader to the wrong fix.
+fn connect_error_with(
+    status: reqwest::StatusCode,
+    path: &str,
+    body: &str,
+    hint: fn(Option<&str>) -> Option<&'static str>,
+) -> String {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         // Not a Connect body at all (proxy HTML, empty 502, ...).
         let body = body.trim();
@@ -225,7 +326,7 @@ fn connect_error(status: reqwest::StatusCode, path: &str, body: &str) -> String 
     if let Some(details) = v.get("details").filter(|d| !d.is_null()) {
         out.push_str(&format!("\n  details: {details}"));
     }
-    if let Some(hint) = recovery_hint(code) {
+    if let Some(hint) = hint(code) {
         out.push_str(&format!("\n  {hint}"));
     }
     out
@@ -250,6 +351,25 @@ fn recovery_hint(code: Option<&str>) -> Option<&'static str> {
         "deadline_exceeded" | "unavailable" => "transient server-side failure: retrying may work",
         _ => return None,
     })
+}
+
+/// Hints for a failed service-account login. The generic `unauthenticated`
+/// hint says "run `bbcli login`", which here would be a trap: a browser login
+/// stores the person's own credentials under the same server URL, silently
+/// replacing the restricted identity with a broad one.
+fn service_account_hint(code: Option<&str>) -> Option<&'static str> {
+    match code {
+        Some("unauthenticated") => Some(
+            "the service key was rejected (rotated, or the account deleted): re-run \
+             `bbcli login --service-account <email>` with a current key — not a browser login, \
+             which would replace this identity with your own",
+        ),
+        Some("resource_exhausted") => Some(
+            "too many failed logins for this account: wait for the lockout to pass, then log in \
+             with a current key",
+        ),
+        _ => recovery_hint(code),
+    }
 }
 
 /// Splits a method reference into (service, method), accepting
@@ -279,6 +399,34 @@ fn method_err(method: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_is_scheduled_from_the_tokens_own_expiry() {
+        use base64::Engine;
+        let enc = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let jwt = format!(
+            "{}.{}.sig",
+            enc(r#"{"alg":"HS256"}"#),
+            enc(r#"{"exp":1700000000}"#)
+        );
+        assert_eq!(jwt_exp(&jwt), Some(1_700_000_000));
+        // Not a JWT: no guess here — the caller falls back to the documented
+        // lifetime instead.
+        assert_eq!(jwt_exp("opaque-token"), None);
+    }
+
+    #[test]
+    fn a_rejected_service_key_never_points_at_a_browser_login() {
+        let body = r#"{"code": "unauthenticated", "message": "invalid email or password"}"#;
+        let msg = connect_error_with(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/p",
+            body,
+            service_account_hint,
+        );
+        assert!(msg.contains("--service-account"), "{msg}");
+        assert!(!msg.contains("run `bbcli login` again"), "{msg}");
+    }
 
     #[test]
     fn method_path_forms() {

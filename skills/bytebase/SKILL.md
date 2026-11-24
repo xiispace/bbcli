@@ -27,6 +27,12 @@ user. If this host has no browser, tell them `bbcli login` prints an
 authorization URL they can open anywhere: the redirect fails to load and they
 paste that failed address back into the prompt. No port forwarding.
 
+The user may instead have logged this environment in as a Bytebase service
+account (`bbcli login --service-account <email>`; `bbcli status` shows it),
+so that you work under narrower roles than theirs. Never ask for, read, or
+pass a service key yourself — that login is the user's to run, like the
+browser one.
+
 `bbcli config view` shows the effective server and all logged-in ones; switch
 the default with `bbcli config use <url>`.
 
@@ -175,7 +181,7 @@ next step, so read it rather than the prose:
 
 | Code | What to do |
 |---|---|
-| `unauthenticated` | Ask the user to re-run `bbcli login`. Do not retry. |
+| `unauthenticated` | Ask the user to re-run `bbcli login` (for a service account: with `--service-account` and a current key — it was likely rotated). Do not retry. |
 | `permission_denied` | The account lacks the role — see `bbcli skill grant-permission`. Do not retry as-is. |
 | `invalid_argument` | Re-check fields with `bbcli search --operation-id <Service/Method>`. |
 | `not_found` | The resource name is wrong; list the parent collection to get a real one. |

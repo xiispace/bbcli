@@ -46,10 +46,14 @@ These are settled trade-offs, not gaps waiting to be filled.
   one credential race the rotation into forced browser re-logins. A keychain
   does not solve that; an exclusive file lock does. See the invariant below.
 
-- **No unattended machine-identity flow.** `login` needs a browser somewhere
-  and a person at it. The browser does not have to be on this host (the
-  redirect can be pasted back), but there is no client-credentials path.
-  bbcli targets interactive agents, not CI.
+- **Service accounts, but no unattended machine-identity flow.**
+  `login --service-account <email>` exists so an agent can act under a
+  narrower Bytebase role than the person driving it — not to make bbcli a CI
+  tool. A person still supplies the key once, on stdin (never argv, never an
+  env var an agent could print); it is stored as a `Grant::ServiceAccount`
+  in `tokens.json` and renews the 1-hour token by re-running
+  `AuthService/Login`. There is no workload-identity (OIDC) exchange and no
+  client-credentials grant; bbcli targets interactive agents, not CI.
 
 - **Unary RPCs only.** Connect JSON streaming endpoints are out of scope;
   one-shot CLI commands rarely want them.
@@ -94,6 +98,18 @@ These are settled trade-offs, not gaps waiting to be filled.
   the refresh out of the lock, and do not replace the in-place locked rewrite
   with an atomic rename — renaming moves the file out from under other
   processes' locks.
+
+- **`Grant` is untagged and flattened into `Credentials`.** That keeps an
+  OAuth entry's on-disk shape identical to files written before service
+  accounts existed — `OAuth` is tried first, so old files keep parsing. A
+  service account is renewed under the same `edit_tokens` lock as an OAuth
+  refresh even though it has no rotation to race: a successful re-login is
+  then shared by the processes queued behind it. A failed one is not (the
+  file is unchanged), so each process retries the same dead key. Its failure
+  hint names `login --service-account`, never a plain `login` — a browser
+  login stores the person's credentials under the same server URL and
+  silently replaces the restricted identity. Its `expires_at` comes from the
+  JWT's `exp`.
 
 - **Refresh-token expiry is a local estimate.** The server issues 30-day
   refresh tokens (`backend/api/oauth2/oauth2.go: refreshTokenExpiry`) but does

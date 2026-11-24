@@ -42,6 +42,10 @@ bbcli sidesteps this:
 - expired access tokens are refreshed proactively (2-minute margin) and
   reactively (retry once after a 401).
 
+Service-account logins (below) have no refresh token to race: their 1-hour
+token is renewed by logging in again with the stored key, under the same lock
+so processes racing an expiry share one successful re-login.
+
 ## Install
 
 On macOS or Linux with [Homebrew](https://brew.sh):
@@ -182,8 +186,32 @@ bbcli skill query                              # bundled task guide
 | `config check` | Verify connectivity and credentials; exits non-zero if unusable — usable as an agent/CI gate |
 | `config path` | Print the credential file path |
 | `login [--as <name>]` | OAuth2 login: RFC 7591 dynamic client registration → browser consent (PKCE S256) → token exchange, via the loopback callback or a pasted redirect URL; `--as` names the server as a context |
-| `status` | List stored credentials with access/refresh token expiry |
-| `logout` | Revoke the refresh token server-side and remove local credentials (drops contexts pointing at it) |
+| `login --service-account <email> [--as <name>]` | Log in as a Bytebase service account: the key (`bbs_...`) is read from stdin, exchanged through `AuthService/Login`, and stored so the 1-hour token renews itself. See [Acting as a service account](#acting-as-a-service-account) |
+| `status` | List stored credentials with token expiry (and, for a service account, its email) |
+| `logout` | Remove local credentials (drops contexts pointing at them); for an OAuth login, also revoke the refresh token server-side. A service key stays valid until rotated in Bytebase |
+
+## Acting as a service account
+
+To have an agent work under narrower permissions than your own, create a
+service account in Bytebase (project-level ones are scoped to that project),
+grant it only the roles the agent needs, and log the agent's environment in
+with its key:
+
+```bash
+op read op://vault/bytebase-agent/key \
+  | bbcli login --context https://bytebase.example.com --as agent \
+      --service-account agent@hr.service.bytebase.com
+```
+
+The key is read from stdin — with echo off when stdin is a terminal — so it
+never sits in argv, shell history or an environment variable an agent might
+print. It is stored in `tokens.json` (`0600`) because, unlike a refresh token,
+it does not expire: bbcli uses it to log in again whenever the 1-hour token
+runs out or is rejected. `logout` removes it locally; to revoke it, rotate or
+delete it in Bytebase.
+
+Credentials are keyed by server URL, so logging a server in as a service
+account replaces any browser login for that server.
 
 ## Logging in when the browser is elsewhere
 
@@ -270,7 +298,8 @@ Two files side by side (gcx-style split of secrets from configuration):
     staging:
       server: https://staging.example.com
   ```
-- **`tokens.json`** — OAuth2 credentials only, keyed by server URL,
+- **`tokens.json`** — credentials only (OAuth2 tokens, or a service
+  account's key and current token), keyed by server URL,
   permissions `0600`, guarded by an advisory file lock shared across bbcli
   processes. Override with `BBCLI_TOKEN_FILE`.
 
@@ -313,9 +342,11 @@ resources are yours to reuse or clean up.
 
 ## Limitations
 
-- **Login needs a browser somewhere, and a person at it.** The browser does
-  not have to be on the same host (see below), but there is no unattended
-  machine-identity flow — bbcli targets interactive agents, not CI.
+- **Login needs a person.** A browser login needs a browser somewhere (not
+  necessarily on the same host); a service-account login needs someone to
+  supply the key once. Service accounts exist so an agent can act under a
+  narrower role — bbcli still targets interactive agents, not CI, and has no
+  workload-identity (OIDC) exchange.
 - Unary RPCs only — Connect JSON streaming endpoints are not covered (rarely
   relevant for one-shot CLI commands).
 - The embedded catalog is a vendored snapshot (`vendor/bytebase/`), not the
@@ -338,7 +369,8 @@ Connect endpoint, and verifies the full lifecycle: login (registration + PKCE
 + code exchange), `api` calls (args/args-file/error propagation), the friendly
 commands (`query` resolution and truncation, `schema` summary vs drill-down,
 the `change propose` chain stopping at the plan), 401-triggered refresh and
-replay, cross-process refresh-token adoption, and logout/revocation.
+replay, cross-process refresh-token adoption, logout/revocation, and the
+service-account login and its renewal.
 
 CI (`.github/workflows/ci.yml`) runs clippy and the unit tests on Linux, macOS
 and Windows, `cargo fmt --check` once, and the E2E script on the two Unix

@@ -20,6 +20,9 @@ handlers. Covers, in order:
      of a refresh token that another process already rotated must adopt the
      file's newer token instead of burning the dead one
   5. logout: server-side revoke + local removal
+  6. service account: key on stdin -> AuthService/Login -> stored grant,
+     renewal by re-login (proactive and after 401), wrong key never echoed,
+     logout says the key is still valid
 
 Usage: python3 scripts/e2e_test.py [path-to-bbcli]
 """
@@ -50,8 +53,19 @@ def make_mock():
         # The sheet content and plan description it last received -- the
         # base64 encoding and --reason are asserted against these.
         "sheet_content": None, "plan_description": None,
+        "sa_logins": 0,
     }
     return httpd
+
+
+SA_EMAIL = "agent@hr.service.bytebase.com"
+SA_KEY = "bbs_e2e_secret"
+
+
+def fake_jwt(exp):
+    """A JWT-shaped token whose exp bbcli reads to schedule renewal."""
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{enc({'alg': 'HS256'})}.{enc({'exp': exp})}.sig"
 
 
 # --- Fixtures for the friendly commands (query / schema / change) ----------
@@ -229,6 +243,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/bytebase.v1.AuthService/Login":
+            # Unauthenticated, like the real handler; service accounts send
+            # their key as the password and web=false to get the token back
+            # in the body.
+            req = json.loads(body)
+            assert req.get("web") is False, req
+            if req.get("email") != SA_EMAIL or req.get("password") != SA_KEY:
+                self._json(401, {"code": "unauthenticated", "message": "invalid email or password"})
+                return
+            state["sa_logins"] += 1
+            state["access"] = fake_jwt(int(time.time()) + 3600 + state["sa_logins"])
+            self._json(200, {"token": state["access"]})
         elif self.path == "/bytebase.v1.MockService/Echo":
             if not self.authed():
                 self._json(401, {"code": "unauthenticated", "message": "invalid token"})
@@ -753,6 +779,50 @@ def main():
         assert server2.state["refresh"] is None
         assert not json.load(open(TOKEN_FILE))["servers"], "credentials not removed locally"
         print("   ok: revoked server-side, contexts and credentials cleaned")
+
+        # --- 6) service account ---
+        step("service account: login, renewal, wrong key, logout")
+        out = run_cli("login", "--context", base, "--as", "agent",
+                      "--service-account", SA_EMAIL, stdin=SA_KEY + "\n")
+        assert SA_KEY not in out.stdout + out.stderr, "key echoed by login"
+        c = load_tokens()
+        assert c["service_account"] == SA_EMAIL and c["service_key"] == SA_KEY, c
+        assert "client_id" not in c and "refresh_token" not in c, c
+        # Renewal is scheduled from the JWT's own exp, not a guess.
+        exp = json.loads(base64.urlsafe_b64decode(c["access_token"].split(".")[1] + "=="))["exp"]
+        assert c["expires_at"] == exp, (c["expires_at"], exp)
+        out = run_cli("api", "MockService/Echo", "--args", '{"sa": 1}').stdout
+        assert json.loads(out) == {"echo": {"sa": 1}}, out
+        status = run_cli("status").stdout
+        assert SA_EMAIL in status and "refresh token" not in status, status
+        assert SA_KEY not in status, "status printed the key"
+
+        # Expired locally -> renewed by logging in again before the call.
+        logins = server.state["sa_logins"]
+        write_tokens(expires_at=1)
+        run_cli("api", "MockService/Echo")
+        assert server.state["sa_logins"] == logins + 1, "no proactive re-login"
+        # Rejected despite a far-future expiry -> re-login and replay.
+        write_tokens(access_token="sa_revoked", expires_at=9999999999)
+        out = run_cli("api", "MockService/Echo", "--args", '{"r": 1}').stdout
+        assert json.loads(out) == {"echo": {"r": 1}}, out
+        assert server.state["sa_logins"] == logins + 2, "401 did not re-login"
+        assert load_tokens()["service_key"] == SA_KEY, "renewal lost the key"
+
+        # A wrong key fails with the server's code and is never echoed, and
+        # the working credentials are left alone.
+        before = load_tokens()
+        bad = run_cli("login", "--context", base, "--service-account", SA_EMAIL,
+                      stdin="bbs_wrong_key\n", expect_fail=True)
+        assert bad.returncode != 0, bad.stdout
+        assert "[unauthenticated]" in bad.stderr, bad.stderr
+        assert "bbs_wrong_key" not in bad.stdout + bad.stderr, "wrong key echoed"
+        assert load_tokens() == before, "failed login touched stored credentials"
+
+        out = run_cli("logout", "--context", "agent").stdout
+        assert "still valid" in out, out
+        assert not json.load(open(TOKEN_FILE))["servers"], "service account not removed locally"
+        print("   ok: key-based login, proactive and 401 renewal, no key leaks")
 
     server.shutdown()
     print("\nALL E2E SCENARIOS PASSED")

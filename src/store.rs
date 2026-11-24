@@ -2,7 +2,8 @@
 //!
 //! - `config.yaml` — non-secret configuration (named contexts, the active
 //!   context). Safe to copy, diff, and edit by hand.
-//! - `tokens.json` — OAuth2 credentials only, keyed by server URL, guarded
+//! - `tokens.json` — credentials only (OAuth2 tokens, or a service account's
+//!   key and current token), keyed by server URL, guarded
 //!   by an advisory exclusive lock (`fd-lock`) and chmod 0600. The lock is
 //!   what lets multiple concurrent bbcli processes share one credential
 //!   despite the server's single-use refresh-token rotation: see
@@ -18,16 +19,43 @@ use anyhow::{Context, Result};
 use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 
-/// One server's credentials. Expiry fields are unix seconds. The refresh
-/// expiry is a local estimate: the server issues 30-day refresh tokens but
-/// does not return its lifetime in the token response.
+/// One server's credentials: the bearer token every call sends, plus the
+/// grant that renews it. `expires_at` is unix seconds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Credentials {
-    pub client_id: String,
     pub access_token: String,
-    pub refresh_token: String,
     pub expires_at: i64,
-    pub refresh_expires_at: i64,
+    #[serde(flatten)]
+    pub grant: Grant,
+}
+
+/// How an expired access token is renewed. Untagged and flattened so the
+/// on-disk shape of an OAuth entry is unchanged from before service accounts
+/// existed: files written by older bbcli parse as `OAuth`, which is tried
+/// first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Grant {
+    /// Browser login. The refresh token is single-use and rotated on every
+    /// refresh — the reason renewal runs under the file lock. Its expiry is
+    /// a local estimate: the server issues 30-day refresh tokens but does
+    /// not return the lifetime in the token response.
+    OAuth {
+        client_id: String,
+        refresh_token: String,
+        refresh_expires_at: i64,
+    },
+    /// A Bytebase service account, so an agent can act under a narrower
+    /// role than the person driving it. `AuthService/Login` with the key
+    /// yields a 1-hour token and no refresh token; renewal is simply logging
+    /// in again, which is idempotent, so there is no rotation to race. The
+    /// key does not expire — it is valid until rotated or the account is
+    /// deleted in Bytebase — which is why it lives here (0600, never in an
+    /// env var an agent might print) and never in an error message.
+    ServiceAccount {
+        service_account: String,
+        service_key: String,
+    },
 }
 
 /// `tokens.json` — credentials only.
@@ -411,12 +439,47 @@ mod tests {
 
     fn creds(id: &str) -> Credentials {
         Credentials {
-            client_id: id.to_string(),
             access_token: format!("at-{id}"),
-            refresh_token: format!("rt-{id}"),
             expires_at: 1000,
-            refresh_expires_at: 2000,
+            grant: Grant::OAuth {
+                client_id: id.to_string(),
+                refresh_token: format!("rt-{id}"),
+                refresh_expires_at: 2000,
+            },
         }
+    }
+
+    #[test]
+    fn token_files_written_before_service_accounts_still_parse_as_oauth() {
+        let legacy = r#"{"servers": {"https://a.example.com": {
+            "client_id": "c", "access_token": "at", "refresh_token": "rt",
+            "expires_at": 1, "refresh_expires_at": 2}}}"#;
+        let tf = parse_tokens(legacy.as_bytes()).unwrap();
+        assert_eq!(
+            tf.servers["https://a.example.com"].grant,
+            Grant::OAuth {
+                client_id: "c".into(),
+                refresh_token: "rt".into(),
+                refresh_expires_at: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_service_account_entry_round_trips_as_a_service_account() {
+        let mut tf = TokenFile::default();
+        let sa = Credentials {
+            access_token: "at".into(),
+            expires_at: 1,
+            grant: Grant::ServiceAccount {
+                service_account: "agent@x.service.bytebase.com".into(),
+                service_key: "bbs_k".into(),
+            },
+        };
+        tf.servers
+            .insert("https://a.example.com".into(), sa.clone());
+        let back = parse_tokens(&render_tokens(&tf).unwrap()).unwrap();
+        assert_eq!(back.servers["https://a.example.com"], sa);
     }
 
     #[test]
@@ -448,8 +511,8 @@ mod tests {
             Some("https://b.example.com")
         );
         assert_eq!(
-            get("https://a.example.com").unwrap().unwrap().client_id,
-            "a"
+            get("https://a.example.com").unwrap().unwrap().access_token,
+            "at-a"
         );
         assert!(get("https://missing").unwrap().is_none());
 
